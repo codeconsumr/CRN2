@@ -1018,8 +1018,9 @@ public class Node implements NodeInterface {
             int nodeNameSpaces = Integer.parseInt(parts[0]);
             String nodeName = parts[1];
 
-            // The relayed message starts after the node name and its trailing space
-            String relayedMessageStart = parts[0].length() + 1 + nodeName.length() + 1;
+            // Calculate the start index for the relayed message
+            // Convert the index calculation to an integer
+            int relayedMessageStart = parts[0].length() + 1 + nodeName.length() + 1;
             String messageToRelay = relayMessage.substring(relayedMessageStart);
 
             // Find the address for the target node
@@ -1055,41 +1056,10 @@ public class Node implements NodeInterface {
             if (messageType == 'G' || messageType == 'N' || messageType == 'E' ||
                     messageType == 'R' || messageType == 'W' || messageType == 'C') {
 
-                // Create a listener for the response
-                byte[] buffer = new byte[4096];
-                DatagramPacket responsePacket = new DatagramPacket(buffer, buffer.length);
-
-                // Set a timeout for the response
-                socket.setSoTimeout(10000);
-
-                try {
-                    // Wait for the response
-                    socket.receive(responsePacket);
-
-                    // Extract the response data
-                    byte[] responseData = Arrays.copyOf(responsePacket.getData(), responsePacket.getLength());
-                    String responseStr = new String(responseData, StandardCharsets.UTF_8);
-
-                    // Check if this is the response we're waiting for
-                    if (responseStr.length() > 2 &&
-                            responseStr.substring(0, 2).equals(new String(relayTxID, StandardCharsets.UTF_8))) {
-
-                        // Replace the transaction ID with our original one and relay back
-                        String relayResponse = new String(txID, StandardCharsets.UTF_8) + responseStr.substring(2);
-                        DatagramPacket relayPacket = new DatagramPacket(
-                                relayResponse.getBytes(StandardCharsets.UTF_8),
-                                relayResponse.length(),
-                                address,
-                                port
-                        );
-                        socket.send(relayPacket);
-                    }
-                } catch (SocketException e) {
-                    // Timeout or error, no response to relay
-                } finally {
-                    // Reset socket timeout
-                    socket.setSoTimeout(0);
-                }
+                // Store the original transaction ID and sender info to relay the response back
+                String relayTxIDStr = new String(relayTxID, StandardCharsets.UTF_8);
+                PendingRequest pendingRelay = new PendingRequest(txID, address, port, "");
+                pendingRequests.put(relayTxIDStr, pendingRelay);
             }
         } catch (Exception e) {
             System.err.println("Error handling relay message: " + e.getMessage());
