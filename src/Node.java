@@ -225,7 +225,7 @@
                 case 'S': handleReadResponse(txID, payload, packet.getAddress(), packet.getPort()); break;
             }
         }
-
+//Test
         @Override
         public boolean isActive(String nodeName) throws Exception {
             String nodeAddress = knownNodes.get(nodeName);

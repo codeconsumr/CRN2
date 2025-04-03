@@ -21,6 +21,7 @@ import java.net.SocketException;
 import java.util.Random;
 import java.util.ArrayList;
 
+
 class LocalTest {
     public static void main (String [] args) {
 	try {
@@ -31,13 +32,13 @@ class LocalTest {
 	    if (args.length > 0) {
 		int n = Integer.parseInt(args[0]);
 		if (n >= 2 && n <= 10) {
-		    numberOfNodes = n; 
+		    numberOfNodes = n;
 		} else {
 		    // If you want more than 10 nodes, you will need
 		    // to change how bootstrapping is done
 		}
 	    }
-	
+
 	    // Create an array of nodes and initialise them
 	    Node [] nodes = new Node [numberOfNodes];
 	    for (int i = 0; i < numberOfNodes; ++i) {
@@ -45,10 +46,10 @@ class LocalTest {
 		nodes[i].setNodeName("N:test" + i);
 		nodes[i].openPort(20110 + i);
 	    }
-	    
+
 	    // Bootstrapping so that nodes know the addresses of some of the others
 	    bootstrap(nodes);
-	    
+
 	    // Start each of the nodes running in a thread
 	    // nodes[0] is handled by this program rather than a thread
 	    for (int i = 1; i < numberOfNodes; ++i) {
@@ -102,7 +103,7 @@ class LocalTest {
 		    System.out.println(" failed?");
 		}
 	    }
-	    
+
 	    // Read them back to make sure the other node handled them correctly
 	    for (int i = 0; i < lines.size(); ++i) {
 		String key = "D:Juliet-" + i;
@@ -121,7 +122,7 @@ class LocalTest {
 	    if (successfulTests == 2*lines.size()) {
 		System.out.println("All tests worked -- that's a good start!");
 	    }
-	    
+
 	} catch (Exception e) {
 	    System.err.println("Exception during localTest");
 	    e.printStackTrace(System.err);
@@ -139,7 +140,7 @@ class LocalTest {
 
         DatagramSocket ds = new DatagramSocket(20099);
 	byte[] contents = {0x30, 0x30, 0x20, 0x57, 0x20, 0x30, 0x20, 0x4E, 0x3A, 0x74, 0x65, 0x73, 0x74, 0x21, 0x20, 0x30, 0x20, 0x31, 0x32, 0x37, 0x2E, 0x30, 0x2E, 0x30, 0x2E, 0x31, 0x3A, 0x32, 0x30, 0x31, 0x31, 0x21, 0x20 };
-	
+
 	for (int i = 0; i < n; ++i) {
 	    for (int j = 0; j < n; ++j) {
 		if (i == j) {
