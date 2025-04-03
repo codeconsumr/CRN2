@@ -92,6 +92,12 @@
 
     // Complete this!
     public class Node implements NodeInterface {
+
+        //Used for CRNTest
+        public int getKnownNodesCount() {
+            return this.knownNodes.size();
+        }
+
         // Node configuration
         private String nodeName;
         private DatagramSocket socket;
@@ -313,7 +319,7 @@
         }
 
         // Helper methods
-        private String computeHashID(String key) {
+        public String computeHashID(String key) {
             byte[] hashBytes = sha256.digest(key.getBytes(StandardCharsets.UTF_8));
             StringBuilder hexString = new StringBuilder();
             for (byte hashByte : hashBytes) {
@@ -363,7 +369,7 @@
             return result;
         }
 
-        private int calculateDistance(String hashID1, String hashID2) {
+        public int calculateDistance(String hashID1, String hashID2) {
             BigInteger h1 = new BigInteger(hashID1, 16);
             BigInteger h2 = new BigInteger(hashID2, 16);
             return h1.xor(h2).bitLength();
