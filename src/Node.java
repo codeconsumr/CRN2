@@ -204,6 +204,83 @@
             }
         }
 
+        private String sendRequestToNearestNodes(String txID, String key) throws Exception {
+            String hashID = computeHashID(key);
+            String request = txID + " N " + hashID;
+
+            // Send to all known nodes (in real implementation would select some)
+            for (Map.Entry<String, String> entry : knownNodes.entrySet()) {
+                String[] addrParts = entry.getValue().split(":");
+                sendMessage(request, InetAddress.getByName(addrParts[0]), Integer.parseInt(addrParts[1]));
+            }
+
+            // Wait for response (simplified - would use proper async handling)
+            DatagramPacket responsePacket = waitForResponse(txID);
+            return new String(responsePacket.getData(), 0, responsePacket.getLength(), StandardCharsets.UTF_8);
+        }
+
+        private List<String> parseNearestNodesResponse(String response) {
+            List<String> nodes = new ArrayList<>();
+            String[] parts = response.split(" ");
+            if (parts.length >= 3 && parts[1].equals("O")) {
+                for (int i = 2; i < parts.length; i++) {
+                    nodes.add(parts[i]);
+                }
+            }
+            return nodes;
+        }
+
+        private String queryNodeForData(String txID, String key, String ip, int port) throws Exception {
+            String request = txID + " R " + key;
+            sendMessage(request, InetAddress.getByName(ip), port);
+
+            DatagramPacket responsePacket = waitForResponse(txID);
+            String response = new String(responsePacket.getData(), 0, responsePacket.getLength(), StandardCharsets.UTF_8);
+            String[] parts = response.split(" ", 3);
+
+            if (parts.length >= 3 && parts[1].equals("S")) {
+                return parts[2]; // Return the value
+            }
+            return null;
+        }
+
+        private String generateTxID() {
+            return UUID.randomUUID().toString().substring(0, 8);
+        }
+        private DatagramPacket waitForResponse(String txID) throws Exception {
+            // Simplified - would use proper timeout and matching logic
+            byte[] buffer = new byte[1024];
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+            socket.receive(packet);
+            return packet;
+        }
+        private void handleReadResponse(String txID, String payload, InetAddress address, int port) {
+            // Format: txID S value
+            String[] parts = payload.split(" ", 2);
+            if (parts.length == 2) {
+                String value = parts[1];
+                // In a real implementation, we would match this to a pending request
+                // and complete the future with this value
+            }
+        }
+
+
+        private void handleNearestResponse(String txID, String payload, InetAddress address, int port) {
+            // Format: txID O node1:port1 node2:port2 node3:port3
+            String[] nodes = payload.split(" ");
+            List<String> nearestNodes = Arrays.asList(nodes).subList(1, nodes.length);
+
+            // Store these nodes as potential candidates for future requests
+            for (String node : nearestNodes) {
+                String[] parts = node.split(":");
+                if (parts.length == 2) {
+                    knownNodes.put(parts[0], node); // Store as "ip:port"
+                }
+            }
+
+            // In a real implementation, we would match this to a pending request
+            // and complete the future associated with this txID
+        }
 
         private void handleRelayRequest(String txID, String payload, InetAddress sender, int senderPort) {
             if (!relayStack.isEmpty()) {
@@ -263,23 +340,28 @@
 
         @Override
         public String read(String key) throws Exception {
-            String hashID = computeHashID(key);
-            if (dataStore.containsKey(hashID)) {
-                return dataStore.get(hashID);
+            // First try local storage
+            String localValue = dataStore.get(key);
+            if (localValue != null) {
+                return localValue;
             }
 
-            // If not found locally, check with closest nodes
-            List<String> closestNodes = findClosestNodes(hashID, 3);
-            for (String node : closestNodes) {
-                String address = knownNodes.get(node);
-                if (address != null) {
-                    String[] addrParts = address.split(":");
-                    String response = sendRequest("READ " + key,
-                            InetAddress.getByName(addrParts[0]),
-                            Integer.parseInt(addrParts[1]));
-                    if (response != null) return response;
+            // If not found locally, follow CRN protocol to find nearest nodes
+            String currentTxID = generateTxID();
+            String nearestNodesResponse = sendRequestToNearestNodes(currentTxID, key);
+
+            // Parse the nearest nodes response
+            List<String> nearestNodes = parseNearestNodesResponse(nearestNodesResponse);
+
+            // Query each nearest node for the data
+            for (String nodeAddress : nearestNodes) {
+                String[] parts = nodeAddress.split(":");
+                String value = queryNodeForData(currentTxID, key, parts[0], Integer.parseInt(parts[1]));
+                if (value != null) {
+                    return value;
                 }
             }
+
             return null;
         }
 
