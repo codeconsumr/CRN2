@@ -441,19 +441,48 @@ public class Node implements NodeInterface {
     public String read(String key) throws Exception {
         byte[] keyHashID = getHashID(key);
 
-        // If stored locally, return directly
+        // 1. Check if stored locally first
         String localValue = dataStore.get(key);
         if (localValue != null) {
             return localValue;
         }
 
-        // Otherwise, find the nearest nodes and ask them
+        // 2. Find the nearest nodes to this key's hash
         List<AddressEntry> nearestNodes = findNearestNodes(keyHashID, 3);
-        if (nearestNodes.isEmpty()) {
-            return null;
+
+        // 3. If we don't know any nodes, try to find some by querying known nodes
+        if (nearestNodes.isEmpty() || nearestNodes.size() < 3) {
+            // Get some known nodes to ask about nearest nodes
+            List<AddressEntry> knownNodes = getAllKnownNodes();
+            if (!knownNodes.isEmpty()) {
+                for (AddressEntry knownNode : knownNodes) {
+                    try {
+                        // Ask this node for its nearest nodes to our target
+                        String hashIDHex = hashIDToHex(keyHashID);
+                        List<AddressEntry> moreNodes = sendNearestRequest(hashIDHex, knownNode);
+
+                        // Add any new nodes we discovered
+                        for (AddressEntry newNode : moreNodes) {
+                            if (!containsNode(nearestNodes, newNode.nodeName)) {
+                                nearestNodes.add(newNode);
+                            }
+                        }
+
+                        // Stop if we have found enough nodes
+                        if (nearestNodes.size() >= 3) {
+                            break;
+                        }
+                    } catch (Exception e) {
+                        // Continue with next node if this one fails
+                    }
+                }
+            }
         }
 
-        // Ask the nearest nodes
+        // Sort by distance to the key
+        Collections.sort(nearestNodes, Comparator.comparingInt(e -> calculateDistance(e.hashID, keyHashID)));
+
+        // 4. Query each of the nearest nodes for the data
         for (AddressEntry node : nearestNodes) {
             try {
                 String value = sendReadRequest(key, node);
@@ -466,6 +495,25 @@ public class Node implements NodeInterface {
         }
 
         return null;
+    }
+
+    // Helper method to get all known nodes from the address entries
+    private List<AddressEntry> getAllKnownNodes() {
+        List<AddressEntry> allNodes = new ArrayList<>();
+        for (List<AddressEntry> entries : addressesByDistance.values()) {
+            allNodes.addAll(entries);
+        }
+        return allNodes;
+    }
+
+    // Helper method to check if a list contains a node with the given name
+    private boolean containsNode(List<AddressEntry> nodes, String nodeName) {
+        for (AddressEntry node : nodes) {
+            if (node.nodeName.equals(nodeName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
@@ -1107,23 +1155,68 @@ public class Node implements NodeInterface {
         List<AddressEntry> result = new ArrayList<>();
 
         if (response != null && response.startsWith("O")) {
-            // Parse the node addresses
-            String[] entries = response.substring(2).split(" 0 ");
-            for (int i = 1; i < entries.length; i += 2) {
-                try {
-                    String nodeName = entries[i].trim();
-                    String nodeAddress = entries[i + 1].trim();
+            // Parse the node addresses - this is key/value format as described in the RFC
+            try {
+                String addressesSection = response.substring(2).trim();
+
+                // Track parsing position
+                int pos = 0;
+                while (pos < addressesSection.length()) {
+                    // Parse node name
+                    int spaceCountEndPos = addressesSection.indexOf(' ', pos);
+                    if (spaceCountEndPos == -1) break;
+
+                    int nodeNameSpaces = Integer.parseInt(addressesSection.substring(pos, spaceCountEndPos));
+                    int nodeNameStart = spaceCountEndPos + 1;
+
+                    // Find node name end (after the specified number of spaces)
+                    int nodeNameEnd = nodeNameStart;
+                    int spacesFound = 0;
+                    while (nodeNameEnd < addressesSection.length() && spacesFound <= nodeNameSpaces) {
+                        if (addressesSection.charAt(nodeNameEnd) == ' ') {
+                            spacesFound++;
+                        }
+                        nodeNameEnd++;
+                    }
+
+                    if (nodeNameEnd > addressesSection.length()) break;
+
+                    String nodeName = addressesSection.substring(nodeNameStart, nodeNameEnd - 1);
+
+                    // Parse address using same technique
+                    pos = nodeNameEnd;
+                    spaceCountEndPos = addressesSection.indexOf(' ', pos);
+                    if (spaceCountEndPos == -1) break;
+
+                    int addressSpaces = Integer.parseInt(addressesSection.substring(pos, spaceCountEndPos));
+                    int addressStart = spaceCountEndPos + 1;
+
+                    int addressEnd = addressStart;
+                    spacesFound = 0;
+                    while (addressEnd < addressesSection.length() && spacesFound <= addressSpaces) {
+                        if (addressesSection.charAt(addressEnd) == ' ') {
+                            spacesFound++;
+                        }
+                        addressEnd++;
+                    }
+
+                    if (addressEnd > addressesSection.length()) break;
+
+                    String nodeAddress = addressesSection.substring(addressStart, addressEnd - 1);
 
                     if (nodeName.startsWith("N:")) {
                         byte[] hashID = getHashID(nodeName);
                         result.add(new AddressEntry(nodeName, nodeAddress, hashID, 0));
 
-                        // Also store this address
+                        // Also store this address for future use
                         storeAddressKeyValue(nodeName, nodeAddress);
                     }
-                } catch (IndexOutOfBoundsException e) {
-                    // Skip invalid entries
+
+                    // Move to next pair
+                    pos = addressEnd;
                 }
+            } catch (Exception e) {
+                System.err.println("Error parsing nearest response: " + e.getMessage());
             }
         }
 
