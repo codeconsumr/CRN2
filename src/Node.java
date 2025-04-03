@@ -441,28 +441,48 @@ public class Node implements NodeInterface {
     public String read(String key) throws Exception {
         byte[] keyHashID = getHashID(key);
 
+        System.out.println("[DEBUG] Trying to read key: " + key);
+        System.out.println("[DEBUG] Key HashID: " + hashIDToHex(keyHashID));
+
         // 1. Check if stored locally first
         String localValue = dataStore.get(key);
         if (localValue != null) {
+            System.out.println("[DEBUG] Found value locally: " + localValue);
             return localValue;
         }
+        System.out.println("[DEBUG] Value not found locally, searching network");
 
         // 2. Find the nearest nodes to this key's hash
         List<AddressEntry> nearestNodes = findNearestNodes(keyHashID, 3);
+        System.out.println("[DEBUG] Initial nearest nodes found: " + nearestNodes.size());
+        for (AddressEntry node : nearestNodes) {
+            System.out.println("[DEBUG] - Node: " + node.nodeName + ", Address: " + node.address);
+        }
 
-        // 3. If we don't know any nodes, try to find some by querying known nodes
+        // 3. If we don't know enough nodes, try to find more by asking known nodes about this hash
         if (nearestNodes.isEmpty() || nearestNodes.size() < 3) {
-            // Get some known nodes to ask about nearest nodes
+            System.out.println("[DEBUG] Not enough nearest nodes, searching for more nodes");
+
+            // Get all known nodes
             List<AddressEntry> knownNodes = getAllKnownNodes();
+            System.out.println("[DEBUG] Total known nodes: " + knownNodes.size());
+
             if (!knownNodes.isEmpty()) {
+                System.out.println("[DEBUG] Asking known nodes for nearest nodes to key: " + key);
+
                 for (AddressEntry knownNode : knownNodes) {
                     try {
-                        // Ask this node for its nearest nodes to our target
+                        System.out.println("[DEBUG] Querying node: " + knownNode.nodeName + " for nearest to " + hashIDToHex(keyHashID));
+
+                        // Ask this node for nodes nearest to our target
                         String hashIDHex = hashIDToHex(keyHashID);
                         List<AddressEntry> moreNodes = sendNearestRequest(hashIDHex, knownNode);
 
+                        System.out.println("[DEBUG] Got " + moreNodes.size() + " nodes from " + knownNode.nodeName);
+
                         // Add any new nodes we discovered
                         for (AddressEntry newNode : moreNodes) {
+                            System.out.println("[DEBUG] - Found node: " + newNode.nodeName + ", Address: " + newNode.address);
                             if (!containsNode(nearestNodes, newNode.nodeName)) {
                                 nearestNodes.add(newNode);
                             }
@@ -470,9 +490,11 @@ public class Node implements NodeInterface {
 
                         // Stop if we have found enough nodes
                         if (nearestNodes.size() >= 3) {
+                            System.out.println("[DEBUG] Found enough nodes, moving on");
                             break;
                         }
                     } catch (Exception e) {
+                        System.out.println("[DEBUG] Error querying node " + knownNode.nodeName + ": " + e.getMessage());
                         // Continue with next node if this one fails
                     }
                 }
@@ -480,20 +502,36 @@ public class Node implements NodeInterface {
         }
 
         // Sort by distance to the key
-        Collections.sort(nearestNodes, Comparator.comparingInt(e -> calculateDistance(e.hashID, keyHashID)));
+        if (!nearestNodes.isEmpty()) {
+            Collections.sort(nearestNodes, Comparator.comparingInt(e -> calculateDistance(e.hashID, keyHashID)));
+
+            System.out.println("[DEBUG] Sorted nearest nodes by distance:");
+            for (AddressEntry node : nearestNodes) {
+                int distance = calculateDistance(node.hashID, keyHashID);
+                System.out.println("[DEBUG] - Node: " + node.nodeName + ", Distance: " + distance);
+            }
+        }
 
         // 4. Query each of the nearest nodes for the data
+        System.out.println("[DEBUG] Querying nearest nodes for key: " + key);
         for (AddressEntry node : nearestNodes) {
             try {
+                System.out.println("[DEBUG] Sending read request to " + node.nodeName);
                 String value = sendReadRequest(key, node);
+
                 if (value != null) {
+                    System.out.println("[DEBUG] Found value from " + node.nodeName + ": " + value);
                     return value;
+                } else {
+                    System.out.println("[DEBUG] Node " + node.nodeName + " does not have the value");
                 }
             } catch (Exception e) {
+                System.out.println("[DEBUG] Error querying node " + node.nodeName + ": " + e.getMessage());
                 // Continue with next node
             }
         }
 
+        System.out.println("[DEBUG] Value not found in network for key: " + key);
         return null;
     }
 
@@ -1140,6 +1178,8 @@ public class Node implements NodeInterface {
     }
 
     private List<AddressEntry> sendNearestRequest(String hashIDHex, AddressEntry node) throws Exception {
+        System.out.println("[DEBUG] Sending nearest request for " + hashIDHex + " to " + node.nodeName);
+
         String[] addressParts = node.address.split(":");
         if (addressParts.length != 2) {
             throw new IllegalArgumentException("Invalid address: " + node.address);
@@ -1149,77 +1189,58 @@ public class Node implements NodeInterface {
         int port = Integer.parseInt(addressParts[1]);
 
         String request = constructRequest("N " + hashIDHex);
+        System.out.println("[DEBUG] Nearest request: " + request);
+
         CompletableFuture<String> future = sendRequestWithRelay(request, address, port);
 
         String response = future.get(15, TimeUnit.SECONDS);
+        System.out.println("[DEBUG] Nearest response: " + response);
+
         List<AddressEntry> result = new ArrayList<>();
 
         if (response != null && response.startsWith("O")) {
-            // Parse the node addresses - this is key/value format as described in the RFC
+            System.out.println("[DEBUG] Parsing O response: " + response.substring(2));
+
+            // Parse the response to extract address entries
             try {
-                String addressesSection = response.substring(2).trim();
+                // The issue is likely in this parsing logic
+                // Your colleague mentioned this is a common issue
 
-                // Track parsing position
-                int pos = 0;
-                while (pos < addressesSection.length()) {
-                    // Parse node name
-                    int spaceCountEndPos = addressesSection.indexOf(' ', pos);
-                    if (spaceCountEndPos == -1) break;
+                // Let's try a simpler approach to parse the O response
+                String responseData = response.substring(2).trim();
+                String[] parts = responseData.split(" 0 ");
 
-                    int nodeNameSpaces = Integer.parseInt(addressesSection.substring(pos, spaceCountEndPos));
-                    int nodeNameStart = spaceCountEndPos + 1;
+                System.out.println("[DEBUG] Split into " + parts.length + " parts");
 
-                    // Find node name end (after the specified number of spaces)
-                    int nodeNameEnd = nodeNameStart;
-                    int spacesFound = 0;
-                    while (nodeNameEnd < addressesSection.length() && spacesFound <= nodeNameSpaces) {
-                        if (addressesSection.charAt(nodeNameEnd) == ' ') {
-                            spacesFound++;
+                for (int i = 1; i < parts.length; i += 2) {
+                    try {
+                        if (i + 1 >= parts.length) {
+                            System.out.println("[DEBUG] Not enough parts for a complete entry at index " + i);
+                            continue;
                         }
-                        nodeNameEnd++;
-                    }
 
-                    if (nodeNameEnd > addressesSection.length()) break;
+                        String nodeName = parts[i].trim();
+                        String nodeAddress = parts[i + 1].trim();
 
-                    String nodeName = addressesSection.substring(nodeNameStart, nodeNameEnd - 1);
+                        System.out.println("[DEBUG] Parsed node: " + nodeName + " at " + nodeAddress);
 
-                    // Parse address using same technique
-                    pos = nodeNameEnd;
-                    spaceCountEndPos = addressesSection.indexOf(' ', pos);
-                    if (spaceCountEndPos == -1) break;
+                        if (nodeName.startsWith("N:")) {
+                            byte[] hashID = getHashID(nodeName);
+                            result.add(new AddressEntry(nodeName, nodeAddress, hashID, 0));
 
-                    int addressSpaces = Integer.parseInt(addressesSection.substring(pos, spaceCountEndPos));
-                    int addressStart = spaceCountEndPos + 1;
-
-                    int addressEnd = addressStart;
-                    spacesFound = 0;
-                    while (addressEnd < addressesSection.length() && spacesFound <= addressSpaces) {
-                        if (addressesSection.charAt(addressEnd) == ' ') {
-                            spacesFound++;
+                            // Also store this address for future use
+                            storeAddressKeyValue(nodeName, nodeAddress);
                         }
-                        addressEnd++;
+                    } catch (Exception e) {
+                        System.out.println("[DEBUG] Error parsing entry at index " + i + ": " + e.getMessage());
                     }
-
-                    if (addressEnd > addressesSection.length()) break;
-
-                    String nodeAddress = addressesSection.substring(addressStart, addressEnd - 1);
-
-                    if (nodeName.startsWith("N:")) {
-                        byte[] hashID = getHashID(nodeName);
-                        result.add(new AddressEntry(nodeName, nodeAddress, hashID, 0));
-
-                        // Also store this address for future use
-                        storeAddressKeyValue(nodeName, nodeAddress);
-                    }
-
-                    // Move to next pair
-                    pos = addressEnd;
                 }
             } catch (Exception e) {
-                System.err.println("Error parsing nearest response: " + e.getMessage());
+                System.out.println("[DEBUG] Error parsing nearest response: " + e.getMessage());
             }
         }
 
+        System.out.println("[DEBUG] Found " + result.size() + " nodes from nearest request");
         return result;
     }
 
