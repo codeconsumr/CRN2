@@ -12,17 +12,18 @@
 // These descriptions are intended to help you understand how the interface
 // will be used. See the RFC for how the protocol works.
 
+
 import java.io.IOException;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
-import java.net.SocketException;
-import java.net.UnknownHostException;
+import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
-import java.util.concurrent.*;
-import java.util.stream.Collectors;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 interface NodeInterface {
 
@@ -91,337 +92,617 @@ interface NodeInterface {
 }
 // DO NOT EDIT ends
 
-class AddressEntry {
-    String nodeName;
-    String address;
-    byte[] hashID;
-    int distance;
-
-    public AddressEntry(String nodeName, String address, byte[] hashID, int distance) {
-        this.nodeName = nodeName;
-        this.address = address;
-        this.hashID = hashID;
-        this.distance = distance;
-    }
-}
-
-class PendingRequest {
-    byte[] transactionID;
-    long timestamp;
-    int attempts;
-    InetAddress address;
-    int port;
-    String originalMessage;
-    CompletableFuture<String> future;
-
-    public PendingRequest(byte[] transactionID, InetAddress address, int port, String originalMessage) {
-        this.transactionID = transactionID;
-        this.timestamp = System.currentTimeMillis();
-        this.attempts = 1;
-        this.address = address;
-        this.port = port;
-        this.originalMessage = originalMessage;
-        this.future = new CompletableFuture<>();
-    }
-}
-
 public class Node implements NodeInterface {
-    // Node configuration
+    // Node properties
     private String nodeName;
-    private byte[] nodeHashID;
     private DatagramSocket socket;
-    private String myAddress;
-    private int myPort;
+    private Map<String, String> keyValueStore = new ConcurrentHashMap<>();
+    private Map<String, InetSocketAddress> nodeAddresses = new ConcurrentHashMap<>();
+    private Stack<String> relayStack = new Stack<>();
+    private int sequenceNumber = new Random().nextInt(100);
+    private Map<String, ResponseHandler> pendingRequests = new ConcurrentHashMap<>();
 
-    // Storage for key/value pairs
-    private final Map<String, String> dataStore = new ConcurrentHashMap<>();
-    private final Map<String, List<AddressEntry>> addressesByDistance = new ConcurrentHashMap<>();
-    private final Map<String, byte[]> hashIDCache = new ConcurrentHashMap<>();
+    // Constants
+    private static final int MAX_PACKET_SIZE = 1024;
+    private static final int REQUEST_TIMEOUT = 5000; // 5 seconds as per RFC
+    private static final int MAX_RETRIES = 3;
 
-    // Network communication
-    private final Random random = new Random();
-    private MessageDigest sha256;
-
-    // Relay stack
-    private final Deque<String> relayStack = new ConcurrentLinkedDeque<>();
-
-    // Pending requests tracking
-    private final Map<String, PendingRequest> pendingRequests = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService requestTimeoutService = Executors.newSingleThreadScheduledExecutor();
-
-    // Processing
-    private final ExecutorService messageProcessor = Executors.newFixedThreadPool(4);
-    private volatile boolean running = false;
-
-    public Node() {
-        try {
-            this.sha256 = MessageDigest.getInstance("SHA-256");
-
-            // Start request timeout checker
-            requestTimeoutService.scheduleAtFixedRate(this::checkPendingRequests, 1, 1, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to initialize node", e);
-        }
-    }
-
-    private void checkPendingRequests() {
-        long currentTime = System.currentTimeMillis();
-
-        pendingRequests.values().forEach(request -> {
-            if (currentTime - request.timestamp > 5000) {
-                if (request.attempts < 4) {
-                    // Resend the request
-                    try {
-                        request.timestamp = currentTime;
-                        request.attempts++;
-                        DatagramPacket packet = new DatagramPacket(
-                                request.originalMessage.getBytes(StandardCharsets.UTF_8),
-                                request.originalMessage.length(),
-                                request.address,
-                                request.port
-                        );
-                        socket.send(packet);
-                    } catch (IOException e) {
-                        request.future.completeExceptionally(e);
-                        pendingRequests.remove(new String(request.transactionID, StandardCharsets.UTF_8));
-                    }
-                } else {
-                    // Max retries reached
-                    request.future.completeExceptionally(new TimeoutException("No response after 3 retries"));
-                    pendingRequests.remove(new String(request.transactionID, StandardCharsets.UTF_8));
-                }
-            }
-        });
-    }
+    // Background thread for handling incoming packets
+    private Thread listenerThread;
+    private volatile boolean running = true;
 
     @Override
     public void setNodeName(String nodeName) throws Exception {
-        if (!nodeName.startsWith("N:")) {
-            nodeName = "N:" + nodeName;
+        if (nodeName == null || nodeName.isEmpty() || !nodeName.startsWith("N:")) {
+            throw new IllegalArgumentException("Node name must start with 'N:'");
         }
         this.nodeName = nodeName;
-        this.nodeHashID = HashID.computeHashID(nodeName);
     }
 
     @Override
     public void openPort(int portNumber) throws Exception {
-        // Close existing socket if open
-        if (socket != null && !socket.isClosed()) {
-            socket.close();
+        if (portNumber < 20110 || portNumber > 20130) {
+            throw new IllegalArgumentException("Port number should be in range 20110-20130");
         }
 
-        // Open new socket on specified port
-        socket = new DatagramSocket(portNumber);
-        myPort = portNumber;
+        if (nodeName == null) {
+            throw new IllegalStateException("Node name must be set before opening port");
+        }
 
-        // Start message receiver thread
-        running = true;
-        new Thread(this::receiveMessages).start();
+        // Create and configure the socket
+        socket = new DatagramSocket(portNumber);
+
+        // Store our own address in the key/value store
+        try {
+            String hostAddress = InetAddress.getLocalHost().getHostAddress();
+            keyValueStore.put(nodeName, hostAddress + ":" + portNumber);
+        } catch (UnknownHostException e) {
+            // If we can't determine our address, use loopback
+            keyValueStore.put(nodeName, "127.0.0.1:" + portNumber);
+        }
+
+        // Start the background listener thread
+        startListenerThread();
     }
 
-    private void receiveMessages() {
-        byte[] buffer = new byte[4096];
-
-        while (running) {
+    private void startListenerThread() {
+        listenerThread = new Thread(() -> {
+            byte[] buffer = new byte[MAX_PACKET_SIZE];
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-            try {
-                socket.receive(packet);
 
-                // Copy the data so it doesn't get overwritten
-                byte[] data = Arrays.copyOf(packet.getData(), packet.getLength());
-                InetAddress senderAddress = packet.getAddress();
-                int senderPort = packet.getPort();
+            while (running && !socket.isClosed()) {
+                try {
+                    // Reset the buffer for the next packet
+                    Arrays.fill(buffer, (byte) 0);
+                    packet.setLength(buffer.length);
 
-                // Process the message in a separate thread
-                messageProcessor.submit(() -> processMessage(data, senderAddress, senderPort));
-            } catch (IOException e) {
-                if (running) {
-                    System.err.println("Error receiving message: " + e.getMessage());
+                    // Wait for a packet
+                    socket.receive(packet);
+
+                    // Process the packet in a new thread to handle multiple concurrent requests
+                    final DatagramPacket finalPacket = new DatagramPacket(
+                            Arrays.copyOf(packet.getData(), packet.getLength()),
+                            packet.getLength(),
+                            packet.getAddress(),
+                            packet.getPort());
+
+                    new Thread(() -> {
+                        try {
+                            processPacket(finalPacket);
+                        } catch (Exception e) {
+                            // Silently handle errors in packet processing
+                        }
+                    }).start();
+
+                } catch (IOException e) {
+                    if (running && !socket.isClosed()) {
+                        // Only log if this wasn't due to socket closing
+                        System.err.println("Error receiving packet: " + e.getMessage());
+                    }
                 }
             }
-        }
+        });
+
+        listenerThread.setDaemon(true);
+        listenerThread.start();
     }
 
     @Override
     public void handleIncomingMessages(int delay) throws Exception {
-        System.out.println("[DEBUG] Handling incoming messages with delay: " + delay);
-
-        // For initial bootstrapping, actively try to discover nodes
-        if (getAllKnownNodes().isEmpty() && delay > 0) {
-            System.out.println("[DEBUG] No known nodes, running discovery...");
-            discoverNodes();
-        }
-
-        // We're already handling messages in the background, just wait the requested time
-        if (delay > 0) {
-            // Process some messages while waiting
-            long endTime = System.currentTimeMillis() + delay;
-            while (System.currentTimeMillis() < endTime) {
-                Thread.sleep(Math.min(100, delay));
-            }
+        System.out.println("[DEBUG-HANDLE] Handling incoming messages with delay: " + delay);
+        if (delay <= 0) {
+            System.out.println("[DEBUG-HANDLE] Delay <= 0, sleeping for 30 seconds");
+            // Wait for 30 seconds when delay is 0 or negative
+            Thread.sleep(30000);
         } else {
-            // Wait indefinitely (until interrupted)
-            synchronized (this) {
-                this.wait();
-            }
+            System.out.println("[DEBUG-HANDLE] Sleeping for " + delay + " ms");
+            // Wait for the specified delay
+            Thread.sleep(delay);
         }
-
-        System.out.println("[DEBUG] After waiting, known nodes: " + getAllKnownNodes().size());
+        System.out.println("[DEBUG-HANDLE] After sleep, known nodes: " + nodeAddresses.keySet());
     }
 
-    // Add this method to actively search for nodes
-    private void discoverNodes() {
-        System.out.println("[DEBUG] Actively discovering nodes...");
-
-        // Try to connect to known test nodes on the Azure lab
-        String[] potentialIPs = {"10.200.51.19", "10.200.51.18", "10.200.51.17"};
-
-        for (String ip : potentialIPs) {
-            for (int i = 0; i < 20; i++) {
-                try {
-                    int port = 20110 + i;
-
-                    // Send a name request
-                    byte[] txID = generateTransactionID();
-                    String request = new String(txID, StandardCharsets.UTF_8) + " G";
-
-                    InetAddress targetAddress = InetAddress.getByName(ip);
-                    DatagramPacket packet = new DatagramPacket(
-                            request.getBytes(StandardCharsets.UTF_8),
-                            request.length(),
-                            targetAddress,
-                            port
-                    );
-                    socket.send(packet);
-
-                    System.out.println("[DEBUG] Sent discovery request to " + ip + ":" + port);
-
-                    // Also try a nearest request for the poem's hash
-                    String poemKeyHash = "84d62238b3e2dcc513014c563480b022e4191fc8092459d95ba1f64a23dbc67f";
-                    String nearestRequest = constructRequest("N " + poemKeyHash);
-
-                    DatagramPacket nearestPacket = new DatagramPacket(
-                            nearestRequest.getBytes(StandardCharsets.UTF_8),
-                            nearestRequest.length(),
-                            targetAddress,
-                            port
-                    );
-                    socket.send(nearestPacket);
-
-                    System.out.println("[DEBUG] Sent nearest request to " + ip + ":" + port);
-
-                    // Wait a bit to allow responses
-                    Thread.sleep(50);
-                } catch (Exception e) {
-                    // Ignore errors and continue
-                }
-            }
-        }
-
-        // Wait a bit for responses to come in
+    private void processPacket(DatagramPacket packet) {
         try {
-            Thread.sleep(500);
-        } catch (InterruptedException e) {
-            // Ignore
-        }
+            String message = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
+            InetAddress sourceAddress = packet.getAddress();
+            int sourcePort = packet.getPort();
 
-        System.out.println("[DEBUG] After discovery, known nodes: " + getAllKnownNodes().size());
+            System.out.println("[DEBUG-PACKET] Received packet from: " + sourceAddress.getHostAddress() + ":" + sourcePort);
+            System.out.println("[DEBUG-PACKET] Message: " + message);
+
+            // Extract and store sender information for passive mapping
+            storeNodeInfo(message, sourceAddress, sourcePort);
+
+            // Process the message
+            String[] parts = message.split(" ", 3);
+            if (parts.length < 2) {
+                System.out.println("[DEBUG-PACKET] Invalid message format, parts < 2");
+                return; // Invalid message format
+            }
+
+            String seqId = parts[0];
+            String command = parts[1];
+            String payload = (parts.length > 2) ? parts[2] : "";
+
+            processMessage(seqId, command, payload, sourceAddress, sourcePort);
+
+        } catch (Exception e) {
+            System.out.println("[DEBUG-PACKET] Error processing packet: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
-
-    private void processMessage(byte[] messageData, InetAddress senderAddress, int senderPort) {
+    private void storeNodeInfo(String message, InetAddress address, int port) {
         try {
-            String message = new String(messageData, StandardCharsets.UTF_8);
-            System.out.println("[DEBUG] Received message: " + message.substring(0, Math.min(20, message.length())) + "...");
-
-            // Store sender's address regardless of message type
-            // This is crucial for network discovery!
-            String senderAddressStr = senderAddress.getHostAddress() + ":" + senderPort;
-            System.out.println("[DEBUG] Message from: " + senderAddressStr);
-
-            // Try to extract a node name from any message
-            String nodeName = null;
-            if (message.length() > 5 && message.contains("N:")) {
-                int nIndex = message.indexOf("N:");
-                if (nIndex >= 0) {
-                    // Extract a potential node name
-                    String potentialName = message.substring(nIndex);
-                    int endIndex = potentialName.indexOf(' ');
-                    if (endIndex > 0) {
-                        nodeName = potentialName.substring(0, endIndex);
-                    } else {
-                        nodeName = potentialName;
+            // Look for node names in the message (starting with "N:")
+            String[] parts = message.split(" ");
+            for (String part : parts) {
+                if (part.startsWith("N:")) {
+                    System.out.println("[DEBUG-NODE] Found node in message: " + part + " at " + address.getHostAddress() + ":" + port);
+                    nodeAddresses.put(part, new InetSocketAddress(address, port));
+                    // Also store in key/value store if not already present
+                    if (!keyValueStore.containsKey(part)) {
+                        keyValueStore.put(part, address.getHostAddress() + ":" + port);
+                        System.out.println("[DEBUG-NODE] Stored node in key-value store: " + part);
                     }
-
-                    // Store this node - this is critical!
-                    if (nodeName.startsWith("N:") && nodeName.length() > 2) {
-                        System.out.println("[DEBUG] Extracted node name: " + nodeName);
-                        storeAddressKeyValue(nodeName, senderAddressStr);
-                    }
+                    System.out.println("[DEBUG-NODE] Known nodes now: " + nodeAddresses.keySet());
+                    break;
                 }
             }
+        } catch (Exception e) {
+            System.out.println("[DEBUG-NODE] Error storing node info: " + e.getMessage());
+        }
+    }
+    private void processMessage(String seqId, String command, String payload,
+                                InetAddress sourceAddress, int sourcePort) {
+        try {
+            System.out.println("[DEBUG] Processing message: " + seqId + " " + command + " " +
+                    (payload.length() > 20 ? payload.substring(0, 20) + "..." : payload));
 
-            // Even if we can't extract a name, store a generic name
-            // This ensures we have at least some nodes to work with
-            if (nodeName == null) {
-                String genericName = "N:discovered" + Math.abs(senderAddressStr.hashCode() % 1000);
-                System.out.println("[DEBUG] Using generic name: " + genericName);
-                storeAddressKeyValue(genericName, senderAddressStr);
-            }
-
-            // Continue with regular message processing...
-            if (message.length() >= 3 && message.charAt(2) == ' ') {
-                // Normal processing
-                String txIDStr = message.substring(0, 2);
-                byte[] txID = txIDStr.getBytes(StandardCharsets.UTF_8);
-                char messageType = message.charAt(3);
-
-                // Process by message type
-                // ... your existing switch case logic
+            switch (command) {
+                case "G": // Name request
+                    handleNameRequest(seqId, payload, sourceAddress, sourcePort);
+                    break;
+                case "H": // Name response
+                    handleNameResponse(seqId, payload);
+                    break;
+                case "N": // Nearest request
+                    handleNearestRequest(seqId, payload, sourceAddress, sourcePort);
+                    break;
+                case "O": // Nearest response
+                    handleNearestResponse(seqId, payload);
+                    break;
+                case "E": // Exists request
+                    handleExistsRequest(seqId, payload, sourceAddress, sourcePort);
+                    break;
+                case "F": // Exists response
+                    handleExistsResponse(seqId, payload);
+                    break;
+                case "R": // Read request
+                    handleReadRequest(seqId, payload, sourceAddress, sourcePort);
+                    break;
+                case "S": // Read response
+                    handleReadResponse(seqId, payload);
+                    break;
+                case "W": // Write request
+                    handleWriteRequest(seqId, payload, sourceAddress, sourcePort);
+                    break;
+                case "X": // Write response
+                    handleWriteResponse(seqId, payload);
+                    break;
+                case "C": // CAS request
+                    handleCASRequest(seqId, payload, sourceAddress, sourcePort);
+                    break;
+                case "D": // CAS response
+                    handleCASResponse(seqId, payload);
+                    break;
+                case "V": // Relay/forward request
+                    handleRelayRequest(seqId, payload, sourceAddress, sourcePort);
+                    break;
+                case "I": // Information message
+                    // Just log it
+                    System.out.println("INFO: " + payload);
+                    break;
+                default:
+                    System.out.println("[DEBUG] Unknown command: " + command);
+                    break;
             }
         } catch (Exception e) {
             System.out.println("[DEBUG] Error processing message: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    // Request Handlers
+
+    private void handleNameRequest(String seqId, String payload, InetAddress sourceAddress, int sourcePort) {
+        try {
+            System.out.println("[DEBUG] Received name request from " + sourceAddress.getHostAddress() + ":" + sourcePort + " (seqId: " + seqId + ")");
+
+            // Format response as per RFC section 6.1
+            String response = seqId + " H " + formatString(nodeName);
+
+            System.out.println("[DEBUG] Sending name response: " + response);
+            sendPacket(response, sourceAddress, sourcePort);
+        } catch (Exception e) {
+            System.out.println("[DEBUG] Error handling name request: " + e.getMessage());
+        }
+    }
+
+    private void handleNearestRequest(String seqId, String payload, InetAddress sourceAddress, int sourcePort) {
+        try {
+            System.out.println("[DEBUG] Received nearest request from " + sourceAddress.getHostAddress() + ":" + sourcePort + " for hash: " + payload);
+
+            String hashIdHex = payload.trim();
+            byte[] targetHashId = hexStringToByteArray(hashIdHex);
+
+            // Find the closest nodes to the target hash
+            List<Map.Entry<String, String>> closestNodes = findClosestNodes(targetHashId, 3);
+
+            System.out.println("[DEBUG] Found " + closestNodes.size() + " closest nodes to hash");
+
+            // Build the response containing up to 3 closest nodes
+            StringBuilder response = new StringBuilder(seqId + " O");
+
+            for (Map.Entry<String, String> entry : closestNodes) {
+                String nodeName = entry.getKey();
+                String nodeAddress = entry.getValue();
+
+                System.out.println("[DEBUG] Including node in response: " + nodeName + " at " + nodeAddress);
+
+                response.append(" ")
+                        .append(formatString(nodeName))
+                        .append(formatString(nodeAddress));
+            }
+
+            System.out.println("[DEBUG] Sending nearest response: " + response.toString());
+            sendPacket(response.toString(), sourceAddress, sourcePort);
+        } catch (Exception e) {
+            System.out.println("[DEBUG] Error handling nearest request: " + e.getMessage());
+        }
+    }
+
+    private void handleExistsRequest(String seqId, String payload, InetAddress sourceAddress, int sourcePort) {
+        try {
+            // Extract the key from the formatted string
+            String key = extractString(payload);
+
+            // Determine the response based on conditions A and B
+            char responseChar;
+
+            // Condition A: Does the node have a key/value pair whose key matches the requested key?
+            if (keyValueStore.containsKey(key)) {
+                responseChar = 'Y';
+            }
+            // Condition B: Is the node one of the three closest nodes to the requested key?
+            else if (isAmongClosestNodes(key, 3)) {
+                responseChar = 'N';
+            }
+            else {
+                responseChar = '?';
+            }
+
+            // Send the response
+            String response = seqId + " F " + responseChar;
+            sendPacket(response, sourceAddress, sourcePort);
+        } catch (Exception e) {
+            // Silently handle errors
+        }
+    }
+
+    private void handleReadRequest(String seqId, String payload, InetAddress sourceAddress, int sourcePort) {
+        try {
+            // Extract the key from the formatted string
+            String key = extractString(payload);
+
+            // Determine the response based on conditions A and B
+            String response;
+
+            // Condition A: Does the node have a key/value pair whose key matches the requested key?
+            if (keyValueStore.containsKey(key)) {
+                String value = keyValueStore.get(key);
+                response = seqId + " S Y " + formatString(value);
+            }
+            // Condition B: Is the node one of the three closest nodes to the requested key?
+            else if (isAmongClosestNodes(key, 3)) {
+                response = seqId + " S N " + formatString("");
+            }
+            else {
+                response = seqId + " S ? " + formatString("");
+            }
+
+            sendPacket(response, sourceAddress, sourcePort);
+        } catch (Exception e) {
+            // Silently handle errors
+        }
+    }
+
+    private void handleWriteRequest(String seqId, String payload, InetAddress sourceAddress, int sourcePort) {
+        try {
+            // Parse the key and value from the formatted string
+            // Format: "spaces key spaces value"
+            String[] parts = splitStringFormat(payload);
+            if (parts.length < 2) {
+                return; // Invalid format
+            }
+
+            String key = parts[0];
+            String value = parts[1];
+
+            // Determine the response based on conditions A and B
+            char responseChar;
+
+            // Condition A: Does the node have a key/value pair whose key matches the requested key?
+            if (keyValueStore.containsKey(key)) {
+                keyValueStore.put(key, value);
+                responseChar = 'R';
+
+                // If this is a node address, update the nodeAddresses map too
+                if (key.startsWith("N:")) {
+                    updateNodeAddress(key, value);
+                }
+            }
+            // Condition B: Is the node one of the three closest nodes to the requested key?
+            else if (isAmongClosestNodes(key, 3)) {
+                keyValueStore.put(key, value);
+                responseChar = 'A';
+
+                // If this is a node address, update the nodeAddresses map too
+                if (key.startsWith("N:")) {
+                    updateNodeAddress(key, value);
+                }
+            }
+            else {
+                responseChar = 'X';
+            }
+
+            // Send the response
+            String response = seqId + " X " + responseChar;
+            sendPacket(response, sourceAddress, sourcePort);
+        } catch (Exception e) {
+            // Silently handle errors
+        }
+    }
+
+    private void handleCASRequest(String seqId, String payload, InetAddress sourceAddress, int sourcePort) {
+        try {
+            // Parse the key, expected value, and new value
+            // Format: "spaces key spaces expectedValue spaces newValue"
+            String[] parts = splitStringFormat(payload);
+            if (parts.length < 3) {
+                return; // Invalid format
+            }
+
+            String key = parts[0];
+            String expectedValue = parts[1];
+            String newValue = parts[2];
+
+            // Determine the response based on conditions A and B
+            char responseChar;
+
+            // Synchronize to ensure atomicity of the CAS operation
+            synchronized (this) {
+                // Condition A: Does the node have a key/value pair whose key matches the requested key?
+                if (keyValueStore.containsKey(key)) {
+                    String currentValue = keyValueStore.get(key);
+                    if (currentValue.equals(expectedValue)) {
+                        keyValueStore.put(key, newValue);
+                        responseChar = 'R';
+
+                        // If this is a node address, update the nodeAddresses map too
+                        if (key.startsWith("N:")) {
+                            updateNodeAddress(key, newValue);
+                        }
+                    } else {
+                        responseChar = 'N';
+                    }
+                }
+                // Condition B: Is the node one of the three closest nodes to the requested key?
+                else if (isAmongClosestNodes(key, 3)) {
+                    keyValueStore.put(key, newValue);
+                    responseChar = 'A';
+
+                    // If this is a node address, update the nodeAddresses map too
+                    if (key.startsWith("N:")) {
+                        updateNodeAddress(key, newValue);
+                    }
+                }
+                else {
+                    responseChar = 'X';
+                }
+            }
+
+            // Send the response
+            String response = seqId + " D " + responseChar;
+            sendPacket(response, sourceAddress, sourcePort);
+        } catch (Exception e) {
+            // Silently handle errors
+        }
+    }
+
+    private void handleRelayRequest(String seqId, String payload, InetAddress sourceAddress, int sourcePort) {
+        try {
+            // Extract target node name and the message to relay
+            String[] parts = splitStringFormat(payload);
+            if (parts.length < 2) {
+                return; // Invalid format
+            }
+
+            String targetNodeName = parts[0];
+            String messageToRelay = parts[1];
+
+            // Find the target node
+            InetSocketAddress targetAddress = nodeAddresses.get(targetNodeName);
+            if (targetAddress == null) {
+                // Try to find the node if we don't know it
+                if (!findNode(targetNodeName)) {
+                    return; // Could not find the node
+                }
+                targetAddress = nodeAddresses.get(targetNodeName);
+                if (targetAddress == null) {
+                    return;
+                }
+            }
+
+            // Parse the message to relay to determine if it's a request
+            String[] relayMsgParts = messageToRelay.split(" ", 2);
+            if (relayMsgParts.length < 2) {
+                return; // Invalid format
+            }
+
+            String relaySeqId = relayMsgParts[0];
+            String relayCommand = relayMsgParts[1];
+
+            // Forward the message to the target node
+            sendPacket(messageToRelay, targetAddress.getAddress(), targetAddress.getPort());
+
+            // If it's a request message, we need to handle the response
+            if (isRequestCommand(relayCommand)) {
+                final String originalSeqId = seqId;
+                final InetAddress replyAddress = sourceAddress;
+                final int replyPort = sourcePort;
+
+                // Set up a handler for the response
+                pendingRequests.put(relaySeqId, response -> {
+                    try {
+                        // Forward the response back to the original sender with the original sequence ID
+                        String relayResponse = originalSeqId + " " + response;
+                        sendPacket(relayResponse, replyAddress, replyPort);
+                    } catch (Exception e) {
+                        // Silently handle errors
+                    }
+                });
+            }
+        } catch (Exception e) {
+            // Silently handle errors
+        }
+    }
+
+    // Response Handlers
+
+    private void handleNameResponse(String seqId, String payload) {
+        // Extract node name from response
+        String nodeName = extractString(payload);
+
+        // Invoke the response handler if one exists for this sequence ID
+        ResponseHandler handler = pendingRequests.get(seqId);
+        if (handler != null) {
+            handler.handleResponse(payload);
+            pendingRequests.remove(seqId);
+        }
+    }
+
+    private void handleNearestResponse(String seqId, String payload) {
+        ResponseHandler handler = pendingRequests.get(seqId);
+        if (handler != null) {
+            handler.handleResponse(payload);
+            pendingRequests.remove(seqId);
+        }
+    }
+
+    private void handleExistsResponse(String seqId, String payload) {
+        ResponseHandler handler = pendingRequests.get(seqId);
+        if (handler != null) {
+            handler.handleResponse(payload);
+            pendingRequests.remove(seqId);
+        }
+    }
+
+    private void handleReadResponse(String seqId, String payload) {
+        ResponseHandler handler = pendingRequests.get(seqId);
+        if (handler != null) {
+            handler.handleResponse(payload);
+            pendingRequests.remove(seqId);
+        }
+    }
+
+    private void handleWriteResponse(String seqId, String payload) {
+        ResponseHandler handler = pendingRequests.get(seqId);
+        if (handler != null) {
+            handler.handleResponse(payload);
+            pendingRequests.remove(seqId);
+        }
+    }
+
+    private void handleCASResponse(String seqId, String payload) {
+        ResponseHandler handler = pendingRequests.get(seqId);
+        if (handler != null) {
+            handler.handleResponse(payload);
+            pendingRequests.remove(seqId);
         }
     }
 
     @Override
     public boolean isActive(String nodeName) throws Exception {
-        if (!nodeName.startsWith("N:")) {
-            nodeName = "N:" + nodeName;
+        // Check if we know the node's address
+        System.out.println("[DEBUG] Checking if node is active: " + nodeName);
+
+        InetSocketAddress nodeAddr = nodeAddresses.get(nodeName);
+        if (nodeAddr == null) {
+            System.out.println("[DEBUG] Node address not found, trying to find it...");
+            // Try to find the node
+            if (!findNode(nodeName)) {
+                System.out.println("[DEBUG] Could not find node: " + nodeName);
+                return false;
+            }
+            nodeAddr = nodeAddresses.get(nodeName);
+            if (nodeAddr == null) {
+                System.out.println("[DEBUG] Still could not get node address after findNode()");
+                return false;
+            }
         }
 
-        // Try to get the address
-        AddressEntry entry = findAddressByNodeName(nodeName);
-        if (entry == null) {
-            return false;
+        System.out.println("[DEBUG] Found node address: " + nodeAddr.getAddress().getHostAddress() + ":" + nodeAddr.getPort());
+
+        // Send a name request to check if the node is active
+        String seqId = generateSequenceId();
+        String request = seqId + " G";
+
+        System.out.println("[DEBUG] Sending activity check to node: " + seqId + " G");
+
+        AtomicBoolean active = new AtomicBoolean(false);
+        CountDownLatch latch = new CountDownLatch(1);
+
+        pendingRequests.put(seqId, response -> {
+            System.out.println("[DEBUG] Received activity response: " + response);
+            active.set(true);
+            latch.countDown();
+        });
+
+        // Send the request with retries
+        boolean responseReceived = false;
+        for (int retry = 0; retry < MAX_RETRIES && !responseReceived; retry++) {
+            if (retry > 0) {
+                System.out.println("[DEBUG] Retrying activity check, attempt " + (retry + 1));
+            }
+
+            sendPacket(request, nodeAddr.getAddress(), nodeAddr.getPort());
+
+            // Wait for the response with timeout
+            responseReceived = latch.await(REQUEST_TIMEOUT, TimeUnit.MILLISECONDS);
         }
 
-        // Send a name request and see if we get a valid response
-        String[] addressParts = entry.address.split(":");
-        if (addressParts.length != 2) {
-            return false;
+        if (!responseReceived) {
+            System.out.println("[DEBUG] No response received for activity check after " + MAX_RETRIES + " attempts");
+        } else {
+            System.out.println("[DEBUG] Node " + nodeName + " is active");
         }
 
-        InetAddress address = InetAddress.getByName(addressParts[0]);
-        int port = Integer.parseInt(addressParts[1]);
-
-        try {
-            byte[] txID = generateTransactionID();
-            String request = new String(txID, StandardCharsets.UTF_8) + " G";
-
-            CompletableFuture<String> future = sendRequest(request, address, port);
-            String response = future.get(10, TimeUnit.SECONDS);
-
-            return response != null && response.charAt(0) == 'H' && response.contains(nodeName);
-        } catch (Exception e) {
-            return false;
-        }
+        pendingRequests.remove(seqId);
+        return active.get();
     }
 
     @Override
     public void pushRelay(String nodeName) throws Exception {
-        if (!nodeName.startsWith("N:")) {
-            nodeName = "N:" + nodeName;
+        if (nodeName == null || !nodeName.startsWith("N:")) {
+            throw new IllegalArgumentException("Node name must start with 'N:'");
         }
+
+        // Check if the node is active before adding it to the relay stack
+        if (!isActive(nodeName)) {
+            throw new IllegalArgumentException("Node is not active");
+        }
+
         relayStack.push(nodeName);
     }
 
@@ -434,36 +715,35 @@ public class Node implements NodeInterface {
 
     @Override
     public boolean exists(String key) throws Exception {
-        byte[] keyHashID = getHashID(key);
+        if (key == null || key.isEmpty()) {
+            throw new IllegalArgumentException("Key cannot be null or empty");
+        }
 
-        // If stored locally, check directly
-        if (dataStore.containsKey(key)) {
+        // Check if we have the key locally
+        if (keyValueStore.containsKey(key)) {
             return true;
         }
 
-        // Otherwise, find the nearest nodes and ask them
-        List<AddressEntry> nearestNodes = findNearestNodes(keyHashID, 3);
-        if (nearestNodes.isEmpty()) {
-            return false;
-        }
+        // Find the three closest nodes to the key
+        byte[] keyHash = computeHashID(key);
+        List<Map.Entry<String, String>> closestNodes = findClosestNodes(keyHash, 3);
 
-        // Check if we are one of the nearest nodes
-        boolean weAreNearestNode = isNodeOneOfNearest(nodeHashID, keyHashID, nearestNodes);
+        // Try checking existence from each node (with relaying if necessary)
+        for (Map.Entry<String, String> entry : closestNodes) {
+            String nodeName = entry.getKey();
+            if (nodeName.equals(this.nodeName)) {
+                continue; // Skip ourselves, we've already checked locally
+            }
 
-        // If we're one of the nearest and we don't have it, it doesn't exist
-        if (weAreNearestNode) {
-            return false;
-        }
+            InetSocketAddress nodeAddr = nodeAddresses.get(nodeName);
+            if (nodeAddr == null) {
+                continue;
+            }
 
-        // Ask the nearest nodes
-        for (AddressEntry node : nearestNodes) {
-            try {
-                String result = sendKeyExistenceRequest(key, node);
-                if (result != null && result.startsWith("Y")) {
-                    return true;
-                }
-            } catch (Exception e) {
-                // Continue with next node
+            // Send an exists request
+            boolean exists = sendExistsRequest(key, nodeAddr);
+            if (exists) {
+                return true;
             }
         }
 
@@ -472,228 +752,585 @@ public class Node implements NodeInterface {
 
     @Override
     public String read(String key) throws Exception {
-        byte[] keyHashID = getHashID(key);
-
-        System.out.println("[DEBUG] Trying to read key: " + key);
-        System.out.println("[DEBUG] Key HashID: " + hashIDToHex(keyHashID));
-
-        // 1. Check if stored locally first
-        String localValue = dataStore.get(key);
-        if (localValue != null) {
-            System.out.println("[DEBUG] Found value locally: " + localValue);
-            return localValue;
-        }
-        System.out.println("[DEBUG] Value not found locally, searching network");
-
-        // If we don't know any nodes, actively discover some
-        List<AddressEntry> knownNodes = getAllKnownNodes();
-        if (knownNodes.isEmpty()) {
-            System.out.println("[DEBUG] No known nodes, running discovery");
-            discoverNodes();
-            knownNodes = getAllKnownNodes();
+        if (key == null || key.isEmpty()) {
+            throw new IllegalArgumentException("Key cannot be null or empty");
         }
 
-        // Critical step: directly ask about this specific poem verse
-        // This is a key insight from your colleague's message
-        String hexHash = hashIDToHex(keyHashID);
+        System.out.println("[DEBUG] Attempting to read key: " + key);
 
-        System.out.println("[DEBUG] Directly querying for poem verse using hash: " + hexHash);
-        String poemVerse = null;
+        // Check if we have the key locally
+        if (keyValueStore.containsKey(key)) {
+            System.out.println("[DEBUG] Found key locally: " + key + " = " + keyValueStore.get(key));
+            return keyValueStore.get(key);
+        }
 
-        // Try direct requests to common poem verse holders
-        String[] specialPorts = {"20110", "20111", "20112", "20113", "20114", "20115"};
-        for (String ip : new String[]{"10.200.51.19", "10.200.51.18"}) {
-            for (String port : specialPorts) {
-                try {
-                    String readRequest = constructRequest("R " + key);
-                    InetAddress targetAddress = InetAddress.getByName(ip);
-                    int targetPort = Integer.parseInt(port);
+        System.out.println("[DEBUG] Key not found locally, searching network...");
 
-                    DatagramPacket packet = new DatagramPacket(
-                            readRequest.getBytes(StandardCharsets.UTF_8),
-                            readRequest.length(),
-                            targetAddress,
-                            targetPort
-                    );
-                    socket.send(packet);
+        // Calculate hash for key
+        byte[] keyHash = computeHashID(key);
+        String keyHashHex = bytesToHex(keyHash);
+        System.out.println("[DEBUG] Key hash: " + keyHashHex);
 
-                    System.out.println("[DEBUG] Sent direct read request to " + ip + ":" + port);
+        // Wait until we know at least one node before continuing
+        if (nodeAddresses.isEmpty()) {
+            System.out.println("[DEBUG] No known nodes. Waiting for contact...");
 
-                    // Wait a bit to allow response
-                    Thread.sleep(300);
+            // Try to manually discover bootstrap nodes on standard CRN ports
+            try {
+                for (int port = 20110; port <= 20116; port++) {
+                    try {
+                        System.out.println("[DEBUG] Trying to discover node at localhost:" + port);
+                        InetAddress addr = InetAddress.getByName("localhost");
+                        InetSocketAddress nodeAddr = new InetSocketAddress(addr, port);
 
-                    // Check if we got the poem verse in our data store (might be updated by response handler)
-                    poemVerse = dataStore.get(key);
-                    if (poemVerse != null) {
-                        System.out.println("[DEBUG] Found poem verse after direct request");
-                        return poemVerse;
+                        // Send a name request to this potential node
+                        String seqId = generateSequenceId();
+                        String request = seqId + " G";
+
+                        AtomicBoolean received = new AtomicBoolean(false);
+                        CountDownLatch latch = new CountDownLatch(1);
+
+                        pendingRequests.put(seqId, response -> {
+                            System.out.println("[DEBUG] Received name response: " + response);
+                            received.set(true);
+                            latch.countDown();
+                        });
+
+                        sendPacket(request, addr, port);
+
+                        // Wait briefly for response
+                        boolean gotResponse = latch.await(2000, TimeUnit.MILLISECONDS);
+                        pendingRequests.remove(seqId);
+
+                        if (gotResponse && received.get()) {
+                            System.out.println("[DEBUG] Successfully discovered node at port " + port);
+                        }
+                    } catch (Exception e) {
+                        System.out.println("[DEBUG] Error trying port " + port + ": " + e.getMessage());
                     }
+                }
+            } catch (Exception e) {
+                System.out.println("[DEBUG] Error during bootstrap discovery: " + e.getMessage());
+            }
+
+            // Wait for nodes to contact us
+            int waitTime = 0;
+            while (nodeAddresses.isEmpty() && waitTime < 30000) { // Wait up to 30 seconds
+                Thread.sleep(1000);
+                waitTime += 1000;
+                System.out.println("[DEBUG] Waiting... Current known nodes: " + nodeAddresses.size());
+            }
+
+            if (nodeAddresses.isEmpty()) {
+                System.out.println("[DEBUG] No nodes contacted us after waiting. Cannot proceed.");
+
+                // Try one more desperate approach - send a broadcast
+                try {
+                    System.out.println("[DEBUG] Attempting broadcast discovery");
+                    // Basic broadcast to common ports
+                    for (int port = 20110; port <= 20116; port++) {
+                        try {
+                            String seqId = generateSequenceId();
+                            String request = seqId + " G";
+                            sendPacket(request, InetAddress.getByName("255.255.255.255"), port);
+                            System.out.println("[DEBUG] Sent broadcast to port " + port);
+                        } catch (Exception e) {
+                            // Ignore errors on broadcast
+                        }
+                    }
+
+                    // Wait a bit more for responses
+                    Thread.sleep(5000);
                 } catch (Exception e) {
-                    // Continue to next target
+                    System.out.println("[DEBUG] Error during broadcast: " + e.getMessage());
+                }
+
+                // If still no nodes, give up
+                if (nodeAddresses.isEmpty()) {
+                    return null;
                 }
             }
         }
 
-        // Rest of your implementation...
-        // (use nearest nodes, etc.)
+        System.out.println("[DEBUG] Known nodes: " + nodeAddresses.keySet());
+        System.out.println("[DEBUG] Nodes count: " + nodeAddresses.size());
 
-        return poemVerse;
-    }
+        // Query each known node for the nearest nodes to our key
+        List<Map.Entry<String, String>> closestNodes = new ArrayList<>();
 
-    // Helper method to get all known nodes from the address entries
-    private List<AddressEntry> getAllKnownNodes() {
-        List<AddressEntry> allNodes = new ArrayList<>();
-        for (List<AddressEntry> entries : addressesByDistance.values()) {
-            allNodes.addAll(entries);
-        }
-        return allNodes;
-    }
+        for (Map.Entry<String, InetSocketAddress> entry : nodeAddresses.entrySet()) {
+            String nodeName = entry.getKey();
+            InetSocketAddress nodeAddr = entry.getValue();
 
-    // Helper method to check if a list contains a node with the given name
-    private boolean containsNode(List<AddressEntry> nodes, String nodeName) {
-        for (AddressEntry node : nodes) {
-            if (node.nodeName.equals(nodeName)) {
-                return true;
+            System.out.println("[DEBUG] Asking " + nodeName + " at " + nodeAddr + " for nearest nodes to " + key);
+
+            try {
+                List<Map.Entry<String, String>> nearestFromNode = sendNearestRequest(keyHashHex, nodeAddr);
+
+                if (nearestFromNode != null && !nearestFromNode.isEmpty()) {
+                    System.out.println("[DEBUG] Received " + nearestFromNode.size() + " nearest nodes from " + nodeName);
+                    for (Map.Entry<String, String> node : nearestFromNode) {
+                        System.out.println("[DEBUG]   - " + node.getKey() + " at " + node.getValue());
+                    }
+                    closestNodes.addAll(nearestFromNode);
+
+                    // Try sending a direct read request to this node as well
+                    String directValue = sendReadRequest(key, nodeAddr);
+                    if (directValue != null) {
+                        System.out.println("[DEBUG] Successfully read value directly from " + nodeName);
+                        keyValueStore.put(key, directValue);
+                        return directValue;
+                    }
+
+                    break;  // We got some nodes, proceed to querying them
+                } else {
+                    System.out.println("[DEBUG] No nearest nodes received from " + nodeName);
+                }
+            } catch (Exception e) {
+                System.out.println("[DEBUG] Error querying " + nodeName + " for nearest nodes: " + e.getMessage());
             }
         }
-        return false;
+
+        // Deduplicate the list of nodes
+        Map<String, String> uniqueNodes = new HashMap<>();
+        for (Map.Entry<String, String> node : closestNodes) {
+            uniqueNodes.put(node.getKey(), node.getValue());
+        }
+
+        System.out.println("[DEBUG] Found " + uniqueNodes.size() + " unique potential nodes to query");
+
+        // Try reading from each node
+        for (Map.Entry<String, String> entry : uniqueNodes.entrySet()) {
+            String nodeName = entry.getKey();
+            String nodeAddress = entry.getValue();
+
+            System.out.println("[DEBUG] Attempting to read from node: " + nodeName + " at " + nodeAddress);
+
+            try {
+                // Parse the address
+                String[] addrParts = nodeAddress.split(":");
+                if (addrParts.length != 2) {
+                    System.out.println("[DEBUG] Invalid address format: " + nodeAddress);
+                    continue;
+                }
+
+                InetSocketAddress nodeAddr = new InetSocketAddress(
+                        InetAddress.getByName(addrParts[0]),
+                        Integer.parseInt(addrParts[1])
+                );
+
+                // Send a read request
+                String value = sendReadRequest(key, nodeAddr);
+                if (value != null) {
+                    System.out.println("[DEBUG] Successfully read value from " + nodeName + ": " +
+                            (value.length() > 30 ? value.substring(0, 30) + "..." : value));
+                    // Cache the value locally
+                    keyValueStore.put(key, value);
+                    return value;
+                } else {
+                    System.out.println("[DEBUG] No value found at " + nodeName);
+                }
+            } catch (Exception e) {
+                System.out.println("[DEBUG] Error querying node " + nodeName + ": " + e.getMessage());
+            }
+        }
+
+        // If we found some nearest nodes but couldn't read from them,
+        // try asking them for their nearest nodes (one level deeper)
+        if (!uniqueNodes.isEmpty()) {
+            System.out.println("[DEBUG] Trying secondary nearest nodes query");
+            List<Map.Entry<String, String>> secondaryNodes = new ArrayList<>();
+
+            for (Map.Entry<String, String> entry : uniqueNodes.entrySet()) {
+                try {
+                    String[] addrParts = entry.getValue().split(":");
+                    if (addrParts.length == 2) {
+                        InetSocketAddress nodeAddr = new InetSocketAddress(
+                                InetAddress.getByName(addrParts[0]),
+                                Integer.parseInt(addrParts[1])
+                        );
+
+                        List<Map.Entry<String, String>> moreNodes = sendNearestRequest(keyHashHex, nodeAddr);
+                        if (moreNodes != null && !moreNodes.isEmpty()) {
+                            secondaryNodes.addAll(moreNodes);
+                        }
+                    }
+                } catch (Exception e) {
+                    // Continue with next node
+                }
+            }
+
+            // Try these secondary nodes
+            Map<String, String> uniqueSecondary = new HashMap<>();
+            for (Map.Entry<String, String> node : secondaryNodes) {
+                uniqueSecondary.put(node.getKey(), node.getValue());
+            }
+
+            // Skip nodes we already tried
+            for (String nodeName : uniqueNodes.keySet()) {
+                uniqueSecondary.remove(nodeName);
+            }
+
+            System.out.println("[DEBUG] Found " + uniqueSecondary.size() + " additional nodes to try");
+
+            // Try reading from these secondary nodes
+            for (Map.Entry<String, String> entry : uniqueSecondary.entrySet()) {
+                try {
+                    String[] addrParts = entry.getValue().split(":");
+                    if (addrParts.length == 2) {
+                        InetSocketAddress nodeAddr = new InetSocketAddress(
+                                InetAddress.getByName(addrParts[0]),
+                                Integer.parseInt(addrParts[1])
+                        );
+
+                        String value = sendReadRequest(key, nodeAddr);
+                        if (value != null) {
+                            System.out.println("[DEBUG] Successfully read value from secondary node " + entry.getKey());
+                            keyValueStore.put(key, value);
+                            return value;
+                        }
+                    }
+                } catch (Exception e) {
+                    // Continue with next node
+                }
+            }
+        }
+
+        System.out.println("[DEBUG] Failed to find key: " + key);
+        return null;
     }
 
     @Override
     public boolean write(String key, String value) throws Exception {
-        byte[] keyHashID = getHashID(key);
+        if (key == null || key.isEmpty() || value == null) {
+            throw new IllegalArgumentException("Key and value cannot be null or empty");
+        }
 
-        // For address keys, handle specially
-        if (key.startsWith("N:")) {
-            // Store locally
-            storeAddressKeyValue(key, value);
-
-            // Also distribute to some other nodes to increase connectivity
-            List<AddressEntry> randomNodes = getRandomAddressEntries(3);
-            for (AddressEntry node : randomNodes) {
-                try {
-                    sendWriteRequest(key, value, node);
-                } catch (Exception e) {
-                    // Ignore failures
-                }
-            }
+        // If this is our own node name, update our address
+        if (key.equals(nodeName)) {
+            keyValueStore.put(key, value);
             return true;
         }
 
-        // For data keys, find the 3 nearest nodes
-        List<AddressEntry> nearestNodes = findNearestNodes(keyHashID, 3);
+        // Find the three closest nodes to the key
+        byte[] keyHash = computeHashID(key);
+        List<Map.Entry<String, String>> closestNodes = findClosestNodes(keyHash, 3);
 
-        // If we don't know any nodes, store locally
-        if (nearestNodes.isEmpty()) {
-            dataStore.put(key, value);
-            return true;
-        }
-
-        // Check if we are one of the nearest nodes
-        boolean weAreNearestNode = isNodeOneOfNearest(nodeHashID, keyHashID, nearestNodes);
-
-        // If we're one of the nearest, store locally
-        if (weAreNearestNode) {
-            dataStore.put(key, value);
-        }
-
-        // Try to store on nearest nodes
         boolean success = false;
-        for (AddressEntry node : nearestNodes) {
-            try {
-                boolean nodeSuccess = sendWriteRequest(key, value, node);
-                success = success || nodeSuccess;
-            } catch (Exception e) {
-                // Continue with next node
+
+        // Try writing to each of the three closest nodes
+        for (Map.Entry<String, String> entry : closestNodes) {
+            String nodeName = entry.getKey();
+
+            // If this is us, write locally
+            if (nodeName.equals(this.nodeName)) {
+                keyValueStore.put(key, value);
+
+                // If this is a node address, update the nodeAddresses map too
+                if (key.startsWith("N:")) {
+                    updateNodeAddress(key, value);
+                }
+
+                success = true;
+                continue;
+            }
+
+            InetSocketAddress nodeAddr = nodeAddresses.get(nodeName);
+            if (nodeAddr == null) {
+                continue;
+            }
+
+            // Send a write request
+            if (sendWriteRequest(key, value, nodeAddr)) {
+                success = true;
             }
         }
 
-        return success || weAreNearestNode;
+        return success;
     }
 
     @Override
     public boolean CAS(String key, String currentValue, String newValue) throws Exception {
-        byte[] keyHashID = getHashID(key);
+        if (key == null || key.isEmpty() || currentValue == null || newValue == null) {
+            throw new IllegalArgumentException("Key, current value, and new value cannot be null or empty");
+        }
 
-        // If stored locally, handle directly
-        if (dataStore.containsKey(key)) {
-            synchronized (dataStore) {
-                if (dataStore.get(key).equals(currentValue)) {
-                    dataStore.put(key, newValue);
+        // If this is our own node name, do a local CAS
+        if (key.equals(nodeName)) {
+            synchronized (this) {
+                String storedValue = keyValueStore.get(key);
+                if (storedValue != null && storedValue.equals(currentValue)) {
+                    keyValueStore.put(key, newValue);
                     return true;
-                } else {
-                    return false;
                 }
+                return false;
             }
         }
 
-        // Otherwise, find the nearest nodes and ask them
-        List<AddressEntry> nearestNodes = findNearestNodes(keyHashID, 3);
-        if (nearestNodes.isEmpty()) {
-            return false;
+        // Find the three closest nodes to the key
+        byte[] keyHash = computeHashID(key);
+        List<Map.Entry<String, String>> closestNodes = findClosestNodes(keyHash, 3);
+
+        boolean success = false;
+
+        // Try CAS on each of the three closest nodes
+        for (Map.Entry<String, String> entry : closestNodes) {
+            String nodeName = entry.getKey();
+
+            // If this is us, do a local CAS
+            if (nodeName.equals(this.nodeName)) {
+                synchronized (this) {
+                    String storedValue = keyValueStore.get(key);
+                    if (storedValue != null && storedValue.equals(currentValue)) {
+                        keyValueStore.put(key, newValue);
+
+                        // If this is a node address, update the nodeAddresses map too
+                        if (key.startsWith("N:")) {
+                            updateNodeAddress(key, newValue);
+                        }
+
+                        success = true;
+                    }
+                }
+                continue;
+            }
+
+            InetSocketAddress nodeAddr = nodeAddresses.get(nodeName);
+            if (nodeAddr == null) {
+                continue;
+            }
+
+            // Send a CAS request
+            if (sendCASRequest(key, currentValue, newValue, nodeAddr)) {
+                success = true;
+            }
         }
 
-        // Try CAS on nearest nodes
-        for (AddressEntry node : nearestNodes) {
-            try {
-                boolean success = sendCASRequest(key, currentValue, newValue, node);
-                if (success) {
-                    return true;
+        return success;
+    }
+
+    // Helper Methods
+
+    private String generateSequenceId() {
+        // Generate a unique sequence ID for requests
+        sequenceNumber = (sequenceNumber + 1) % 100;
+        return String.format("%s%02d", nodeName.substring(2), sequenceNumber);
+    }
+
+    private void sendPacket(String message, InetAddress address, int port) throws IOException {
+        // Check if we need to relay the message
+        if (!relayStack.isEmpty()) {
+            // Get the top relay node
+            String relayNodeName = relayStack.peek();
+            InetSocketAddress relayAddr = nodeAddresses.get(relayNodeName);
+
+            if (relayAddr != null) {
+                // Create a relay message
+                String relayMsg = generateSequenceId() + " V " + formatString(relayNodeName) + message;
+
+                // Send to the relay node instead
+                byte[] data = relayMsg.getBytes(StandardCharsets.UTF_8);
+                DatagramPacket packet = new DatagramPacket(data, data.length, relayAddr.getAddress(), relayAddr.getPort());
+                socket.send(packet);
+                return;
+            }
+        }
+
+        // Direct send if no relay or relay not found
+        byte[] data = message.getBytes(StandardCharsets.UTF_8);
+        DatagramPacket packet = new DatagramPacket(data, data.length, address, port);
+        socket.send(packet);
+    }
+
+    private String formatString(String str) {
+        // Format a string as per CRN protocol: "spaceCount string "
+        int spaceCount = countSpaces(str);
+        return spaceCount + " " + str + " ";
+    }
+
+    private int countSpaces(String str) {
+        // Count the number of spaces in a string
+        int count = 0;
+        for (char c : str.toCharArray()) {
+            if (c == ' ') {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private String extractString(String formattedStr) {
+        // Extract the string from CRN format "spaceCount string "
+        String[] parts = formattedStr.trim().split(" ", 2);
+        if (parts.length < 2) {
+            return "";
+        }
+        return parts[1];
+    }
+
+    private String[] splitStringFormat(String payload) {
+        // Split a payload containing multiple formatted strings
+        // Example: "0 key 1 value " -> ["key", "value"]
+        List<String> results = new ArrayList<>();
+
+        System.out.println("[DEBUG] Parsing CRN format string: " + payload);
+
+        int i = 0;
+        while (i < payload.length()) {
+            // Skip leading whitespace
+            while (i < payload.length() && payload.charAt(i) == ' ') {
+                i++;
+            }
+
+            if (i >= payload.length()) {
+                break;
+            }
+
+            // Parse the space count
+            int j = i;
+            while (j < payload.length() && Character.isDigit(payload.charAt(j))) {
+                j++;
+            }
+
+            if (j >= payload.length() || j == i) {
+                System.out.println("[DEBUG] Could not parse space count at position " + i);
+                break;
+            }
+
+            int spaceCount = Integer.parseInt(payload.substring(i, j));
+            System.out.println("[DEBUG] Found space count: " + spaceCount);
+
+            // Skip the space after the count
+            j++;
+
+            // Find the string
+            i = j;
+            int spacesFound = 0;
+
+            // Find the end of the string (after spaceCount spaces and one more)
+            while (j < payload.length()) {
+                if (payload.charAt(j) == ' ') {
+                    spacesFound++;
+                    if (spacesFound > spaceCount) {
+                        break;
+                    }
                 }
+                j++;
+            }
+
+            if (j > i) {
+                // Extract the string without the trailing space
+                String extractedStr = payload.substring(i, j);
+                System.out.println("[DEBUG] Extracted string: " + extractedStr);
+                results.add(extractedStr);
+            } else {
+                System.out.println("[DEBUG] Could not extract string at position " + i);
+            }
+
+            i = j + 1;
+        }
+
+        System.out.println("[DEBUG] Parsed " + results.size() + " strings from payload");
+        return results.toArray(new String[0]);
+    }
+
+    private void updateNodeAddress(String nodeName, String addressStr) {
+        try {
+            String[] parts = addressStr.split(":");
+            if (parts.length == 2) {
+                InetAddress addr = InetAddress.getByName(parts[0]);
+                int port = Integer.parseInt(parts[1]);
+                nodeAddresses.put(nodeName, new InetSocketAddress(addr, port));
+            }
+        } catch (Exception e) {
+            // Silently handle errors
+        }
+    }
+
+    private boolean isAmongClosestNodes(String key, int count) throws Exception {
+        // Check if this node is among the count closest nodes to the key
+        byte[] keyHash = computeHashID(key);
+        byte[] nodeHash = computeHashID(nodeName);
+
+        // Find all known nodes
+        List<Map.Entry<String, String>> allNodes = new ArrayList<>();
+        for (Map.Entry<String, String> entry : keyValueStore.entrySet()) {
+            if (entry.getKey().startsWith("N:")) {
+                allNodes.add(entry);
+            }
+        }
+
+        // Sort by distance to the key
+        final byte[] finalKeyHash = keyHash;
+        allNodes.sort((e1, e2) -> {
+            try {
+                byte[] h1 = computeHashID(e1.getKey());
+                byte[] h2 = computeHashID(e2.getKey());
+                return Integer.compare(
+                        calculateDistance(h1, finalKeyHash),
+                        calculateDistance(h2, finalKeyHash)
+                );
             } catch (Exception e) {
-                // Continue with next node
+                return 0;
+            }
+        });
+
+        // Check if our node is among the closest count nodes
+        for (int i = 0; i < Math.min(count, allNodes.size()); i++) {
+            if (allNodes.get(i).getKey().equals(nodeName)) {
+                return true;
             }
         }
 
         return false;
     }
 
-    // Helper methods for CRN protocol handling
+    private List<Map.Entry<String, String>> findClosestNodes(byte[] targetHash, int count) {
+        // Find the count closest nodes to the target hash
+        List<Map.Entry<String, String>> allNodes = new ArrayList<>();
 
-    private byte[] generateTransactionID() {
-        byte[] txID = new byte[2];
-        do {
-            random.nextBytes(txID);
-        } while (txID[0] == 0x20 || txID[1] == 0x20); // Ensure no spaces
-        return txID;
-    }
-
-    private byte[] getHashID(String key) {
-        if (hashIDCache.containsKey(key)) {
-            return hashIDCache.get(key);
+        // Add all known nodes to the list
+        for (Map.Entry<String, String> entry : keyValueStore.entrySet()) {
+            if (entry.getKey().startsWith("N:")) {
+                allNodes.add(entry);
+            }
         }
 
-        try {
-            byte[] hashID = HashID.computeHashID(key);
-            hashIDCache.put(key, hashID);
-            return hashID;
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to compute hashID for " + key, e);
-        }
+        // Sort by distance to the target hash
+        final byte[] finalTargetHash = targetHash;
+        allNodes.sort((e1, e2) -> {
+            try {
+                byte[] h1 = computeHashID(e1.getKey());
+                byte[] h2 = computeHashID(e2.getKey());
+                return Integer.compare(
+                        calculateDistance(h1, finalTargetHash),
+                        calculateDistance(h2, finalTargetHash)
+                );
+            } catch (Exception e) {
+                return 0;
+            }
+        });
+
+        // Return the closest count nodes
+        return allNodes.subList(0, Math.min(count, allNodes.size()));
     }
 
-    private String hashIDToHex(byte[] hashID) {
-        StringBuilder hex = new StringBuilder();
-        for (byte b : hashID) {
-            hex.append(String.format("%02x", b));
-        }
-        return hex.toString();
-    }
+    /**
+     * Calculate the distance between two hashIDs as defined in the CRN RFC.
+     * The distance is 256 minus the number of leading bits that match.
+     */
+    private int calculateDistance(byte[] hash1, byte[] hash2) {
+        int matchingBits = 0;
 
-    private int calculateDistance(byte[] hashID1, byte[] hashID2) {
-        // Calculate the distance as per RFC (256 - number of leading matching bits)
-        int leadingMatchingBits = 0;
-
-        for (int i = 0; i < hashID1.length; i++) {
-            byte xor = (byte) (hashID1[i] ^ hashID2[i]);
-
-            if (xor == 0) {
-                leadingMatchingBits += 8;
+        for (int i = 0; i < hash1.length && i < hash2.length; i++) {
+            if (hash1[i] == hash2[i]) {
+                matchingBits += 8;
             } else {
-                // Find the position of the first 1 bit
+                // Count matching bits in this byte
+                int xor = hash1[i] ^ hash2[i];
                 for (int j = 7; j >= 0; j--) {
                     if ((xor & (1 << j)) == 0) {
-                        leadingMatchingBits++;
+                        matchingBits++;
                     } else {
                         break;
                     }
@@ -702,700 +1339,300 @@ public class Node implements NodeInterface {
             }
         }
 
-        return 256 - leadingMatchingBits;
+        return 256 - matchingBits;
     }
 
-    private String formatString(String str) {
-        int spaceCount = 0;
-        for (char c : str.toCharArray()) {
-            if (c == ' ') spaceCount++;
+    /**
+     * Compute the SHA-256 hash of a key.
+     */
+    private byte[] computeHashID(String key) throws NoSuchAlgorithmException {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        return digest.digest(key.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Converts a hex string to a byte array.
+     */
+    private byte[] hexStringToByteArray(String hex) {
+        int len = hex.length();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
+                    + Character.digit(hex.charAt(i+1), 16));
         }
-        return spaceCount + " " + str + " ";
+        return data;
     }
 
-    private String parseString(String formattedStr) {
-        String[] parts = formattedStr.split(" ", 3);
-        if (parts.length < 3) {
-            return "";
+    /**
+     * Converts a byte array to a hex string.
+     */
+    private String bytesToHex(byte[] bytes) {
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : bytes) {
+            String hex = Integer.toHexString(0xff & b);
+            if (hex.length() == 1) {
+                hexString.append('0');
+            }
+            hexString.append(hex);
         }
-        return parts[1];
+        return hexString.toString();
     }
 
-    private void storeAddressKeyValue(String nodeNameKey, String addressValue) {
-        try {
-            if (!nodeNameKey.startsWith("N:")) {
-                return;
+    private boolean findNode(String nodeName) throws Exception {
+        // Try to find a node in the network
+        byte[] nodeHash = computeHashID(nodeName);
+        String nodeHashHex = bytesToHex(nodeHash);
+
+        // Start with the nodes we know
+        for (Map.Entry<String, InetSocketAddress> entry : nodeAddresses.entrySet()) {
+            if (entry.getKey().equals(nodeName)) {
+                return true; // We already know this node
             }
 
-            byte[] hashID = getHashID(nodeNameKey);
-            int distance = calculateDistance(nodeHashID, hashID);
+            // Send a nearest request to this node
+            List<Map.Entry<String, String>> nearestNodes = sendNearestRequest(nodeHashHex, entry.getValue());
 
-            // Create or get the list for this distance
-            List<AddressEntry> entriesAtDistance = addressesByDistance.computeIfAbsent(
-                    String.valueOf(distance),
-                    k -> new CopyOnWriteArrayList<>()
-            );
-
-            // Check if we already have this node
-            for (AddressEntry entry : entriesAtDistance) {
-                if (entry.nodeName.equals(nodeNameKey)) {
-                    // Update the address
-                    entry.address = addressValue;
-                    return;
-                }
-            }
-
-            // Add new entry
-            entriesAtDistance.add(new AddressEntry(nodeNameKey, addressValue, hashID, distance));
-
-            // Limit to 3 entries per distance
-            if (entriesAtDistance.size() > 3) {
-                // Remove oldest (or implement your own policy)
-                entriesAtDistance.remove(0);
-            }
-        } catch (Exception e) {
-            System.err.println("Error storing address key/value: " + e.getMessage());
-        }
-    }
-
-    private AddressEntry findAddressByNodeName(String nodeName) {
-        for (List<AddressEntry> entries : addressesByDistance.values()) {
-            for (AddressEntry entry : entries) {
-                if (entry.nodeName.equals(nodeName)) {
-                    return entry;
-                }
-            }
-        }
-        return null;
-    }
-
-    private List<AddressEntry> findNearestNodes(byte[] targetHashID, int count) {
-        // Create a sorted list of all address entries by distance to target
-        List<AddressEntry> allEntries = new ArrayList<>();
-
-        for (List<AddressEntry> entries : addressesByDistance.values()) {
-            for (AddressEntry entry : entries) {
-                int distance = calculateDistance(targetHashID, entry.hashID);
-                entry.distance = distance;
-                allEntries.add(entry);
-            }
-        }
-
-        // Sort by distance
-        Collections.sort(allEntries, Comparator.comparingInt(e -> e.distance));
-
-        // Return the closest 'count' entries
-        return allEntries.stream()
-                .limit(count)
-                .collect(Collectors.toList());
-    }
-
-    private boolean isNodeOneOfNearest(byte[] nodeHashID, byte[] targetHashID, List<AddressEntry> nearestNodes) {
-        int ourDistance = calculateDistance(nodeHashID, targetHashID);
-
-        for (AddressEntry entry : nearestNodes) {
-            if (entry.distance > ourDistance) {
-                return true;
-            }
-        }
-
-        return nearestNodes.size() < 3;
-    }
-
-    private List<AddressEntry> getRandomAddressEntries(int count) {
-        List<AddressEntry> allEntries = new ArrayList<>();
-
-        for (List<AddressEntry> entries : addressesByDistance.values()) {
-            allEntries.addAll(entries);
-        }
-
-        if (allEntries.isEmpty()) {
-            return Collections.emptyList();
-        }
-
-        Collections.shuffle(allEntries);
-        return allEntries.stream()
-                .limit(Math.min(count, allEntries.size()))
-                .collect(Collectors.toList());
-    }
-
-    private CompletableFuture<String> sendRequest(String message, InetAddress address, int port) {
-        try {
-            byte[] txID = message.substring(0, 2).getBytes(StandardCharsets.UTF_8);
-            String txIDStr = new String(txID, StandardCharsets.UTF_8);
-
-            // Create pending request
-            PendingRequest pendingRequest = new PendingRequest(txID, address, port, message);
-            pendingRequests.put(txIDStr, pendingRequest);
-
-            // Send the message
-            DatagramPacket packet = new DatagramPacket(
-                    message.getBytes(StandardCharsets.UTF_8),
-                    message.length(),
-                    address,
-                    port
-            );
-            socket.send(packet);
-
-            return pendingRequest.future;
-        } catch (IOException e) {
-            CompletableFuture<String> future = new CompletableFuture<>();
-            future.completeExceptionally(e);
-            return future;
-        }
-    }
-
-    private void sendResponse(byte[] txID, String responseData, InetAddress address, int port) {
-        try {
-            String response = new String(txID, StandardCharsets.UTF_8) + responseData;
-            DatagramPacket packet = new DatagramPacket(
-                    response.getBytes(StandardCharsets.UTF_8),
-                    response.length(),
-                    address,
-                    port
-            );
-            socket.send(packet);
-        } catch (IOException e) {
-            System.err.println("Error sending response: " + e.getMessage());
-        }
-    }
-
-    // Message handlers
-
-    private void handleNameRequest(byte[] txID, InetAddress address, int port) {
-        String response = " H " + formatString(nodeName);
-        sendResponse(txID, response, address, port);
-    }
-
-    private void handleNameResponse(String txIDStr, String responseData, InetAddress address, int port) {
-        PendingRequest request = pendingRequests.remove(txIDStr);
-        if (request != null) {
-            request.future.complete(responseData);
-        }
-    }
-
-    private void handleNearestRequest(byte[] txID, String hashIDHex, InetAddress address, int port) {
-        // Convert hex to byte array
-        byte[] targetHashID = new byte[32];
-        for (int i = 0; i < 32; i++) {
-            targetHashID[i] = (byte) Integer.parseInt(hashIDHex.substring(i * 2, i * 2 + 2), 16);
-        }
-
-        // Find nearest nodes
-        List<AddressEntry> nearestNodes = findNearestNodes(targetHashID, 3);
-
-        // Format response
-        StringBuilder response = new StringBuilder(" O ");
-
-        for (AddressEntry entry : nearestNodes) {
-            response.append("0 ")
-                    .append(entry.nodeName)
-                    .append(" 0 ")
-                    .append(entry.address)
-                    .append(" ");
-        }
-
-        sendResponse(txID, response.toString(), address, port);
-    }
-
-    private void handleNearestResponse(String txIDStr, String responseData) {
-        PendingRequest request = pendingRequests.remove(txIDStr);
-        if (request != null) {
-            request.future.complete(responseData);
-
-            // Parse and store address entries
-            String[] entries = responseData.split(" 0 ");
-            for (int i = 1; i < entries.length; i += 2) {
-                try {
-                    String nodeName = entries[i].trim();
-                    String address = entries[i + 1].trim();
-
-                    if (nodeName.startsWith("N:")) {
-                        storeAddressKeyValue(nodeName, address);
+            if (nearestNodes != null) {
+                for (Map.Entry<String, String> nearNode : nearestNodes) {
+                    if (nearNode.getKey().equals(nodeName)) {
+                        // Found the node, store its address
+                        updateNodeAddress(nodeName, nearNode.getValue());
+                        keyValueStore.put(nodeName, nearNode.getValue());
+                        return true;
                     }
-                } catch (IndexOutOfBoundsException e) {
-                    // Skip invalid entries
-                }
-            }
-        }
-    }
 
-    private void handleKeyExistenceRequest(byte[] txID, String key, InetAddress address, int port) {
-        byte[] keyHashID = getHashID(key);
-
-        // Check if we have the key
-        if (dataStore.containsKey(key)) {
-            sendResponse(txID, " F Y", address, port);
-            return;
-        }
-
-        // Check if we're one of the nearest nodes
-        List<AddressEntry> nearestNodes = findNearestNodes(keyHashID, 3);
-        boolean weAreNearestNode = isNodeOneOfNearest(nodeHashID, keyHashID, nearestNodes);
-
-        if (weAreNearestNode) {
-            sendResponse(txID, " F N", address, port);
-        } else {
-            sendResponse(txID, " F ?", address, port);
-        }
-    }
-
-    private void handleKeyExistenceResponse(String txIDStr, String responseData) {
-        PendingRequest request = pendingRequests.remove(txIDStr);
-        if (request != null) {
-            request.future.complete(responseData);
-        }
-    }
-
-    private void handleReadRequest(byte[] txID, String key, InetAddress address, int port) {
-        byte[] keyHashID = getHashID(key);
-
-        // Check if we have the key
-        String value = dataStore.get(key);
-        if (value != null) {
-            String response = " S Y " + formatString(value);
-            sendResponse(txID, response, address, port);
-            return;
-        }
-
-        // Check if we're one of the nearest nodes
-        List<AddressEntry> nearestNodes = findNearestNodes(keyHashID, 3);
-        boolean weAreNearestNode = isNodeOneOfNearest(nodeHashID, keyHashID, nearestNodes);
-
-        if (weAreNearestNode) {
-            sendResponse(txID, " S N 0  ", address, port);
-        } else {
-            sendResponse(txID, " S ? 0  ", address, port);
-        }
-    }
-
-    private void handleReadResponse(String txIDStr, String responseData) {
-        PendingRequest request = pendingRequests.remove(txIDStr);
-        if (request != null) {
-            request.future.complete(responseData);
-        }
-    }
-
-    private void handleWriteRequest(byte[] txID, String keyValueData, InetAddress address, int port) {
-        // Parse the key and value
-        String[] parts = keyValueData.split(" ", 4);
-        if (parts.length < 4) {
-            // Invalid format
-            sendResponse(txID, " X X", address, port);
-            return;
-        }
-
-        int keySpaces = Integer.parseInt(parts[0]);
-        String key = parts[1];
-
-        // Value starts after key and its space
-        String valueStr = keyValueData.substring(parts[0].length() + 1 + key.length() + 1);
-        String value = parseString(valueStr);
-
-        byte[] keyHashID = getHashID(key);
-
-        // Check if we already have this key
-        boolean hasKey = dataStore.containsKey(key);
-
-        // Check if we're one of the nearest nodes
-        List<AddressEntry> nearestNodes = findNearestNodes(keyHashID, 3);
-        boolean weAreNearestNode = isNodeOneOfNearest(nodeHashID, keyHashID, nearestNodes);
-
-        if (hasKey) {
-            // Replace existing value
-            dataStore.put(key, value);
-            sendResponse(txID, " X R", address, port);
-        } else if (weAreNearestNode) {
-            // We're one of the three closest nodes, so accept the write
-            dataStore.put(key, value);
-            sendResponse(txID, " X A", address, port);
-        } else {
-            // We're not one of the three closest nodes, so reject
-            sendResponse(txID, " X X", address, port);
-        }
-    }
-
-    private void handleWriteResponse(String txIDStr, String responseData) {
-        PendingRequest request = pendingRequests.remove(txIDStr);
-        if (request != null) {
-            request.future.complete(responseData);
-        }
-    }
-
-    private void handleCompareAndSwapRequest(byte[] txID, String casData, InetAddress address, int port) {
-        try {
-            // Parse key and the two values
-            String[] initialParts = casData.split(" ", 4);
-            if (initialParts.length < 4) {
-                sendResponse(txID, " D X", address, port);
-                return;
-            }
-
-            int keySpaces = Integer.parseInt(initialParts[0]);
-            String key = initialParts[1];
-
-            // Extract the part containing the current value and new value
-            String valuesStr = casData.substring(initialParts[0].length() + 1 + key.length() + 1);
-
-            // Parse current value
-            String[] valueParts = valuesStr.split(" ", 2);
-            int currentValueSpaces = Integer.parseInt(valueParts[0]);
-
-            String currentValueWithSpace = valueParts[1];
-            String[] currentValueParts = currentValueWithSpace.split(" ", currentValueSpaces + 2);
-            StringBuilder currentValueBuilder = new StringBuilder();
-            for (int i = 0; i < currentValueSpaces + 1; i++) {
-                currentValueBuilder.append(currentValueParts[i]);
-                if (i < currentValueSpaces) {
-                    currentValueBuilder.append(" ");
-                }
-            }
-            String currentValue = currentValueBuilder.toString();
-
-            // Extract the new value part
-            String newValuePart = valuesStr.substring(valueParts[0].length() + 1 + currentValue.length() + 1);
-            String newValue = parseString(newValuePart);
-
-            byte[] keyHashID = getHashID(key);
-
-            // Check if we have the key
-            boolean hasKey = dataStore.containsKey(key);
-
-            // Check if we're one of the nearest nodes
-            List<AddressEntry> nearestNodes = findNearestNodes(keyHashID, 3);
-            boolean weAreNearestNode = isNodeOneOfNearest(nodeHashID, keyHashID, nearestNodes);
-
-            if (hasKey) {
-                // Synchronize to ensure atomicity of CAS operation
-                synchronized (dataStore) {
-                    String storedValue = dataStore.get(key);
-                    if (storedValue.equals(currentValue)) {
-                        dataStore.put(key, newValue);
-                        sendResponse(txID, " D R", address, port);
-                    } else {
-                        sendResponse(txID, " D N", address, port);
+                    // Also store other discovered nodes
+                    if (nearNode.getKey().startsWith("N:")) {
+                        updateNodeAddress(nearNode.getKey(), nearNode.getValue());
+                        keyValueStore.put(nearNode.getKey(), nearNode.getValue());
                     }
                 }
-            } else if (weAreNearestNode) {
-                // We're one of the three closest nodes, so accept the write with new value
-                dataStore.put(key, newValue);
-                sendResponse(txID, " D A", address, port);
-            } else {
-                // We're not one of the three closest nodes, so reject
-                sendResponse(txID, " D X", address, port);
             }
-        } catch (Exception e) {
-            System.err.println("Error handling CAS request: " + e.getMessage());
-            sendResponse(txID, " D X", address, port);
         }
+
+        return false;
     }
 
-    private void handleCompareAndSwapResponse(String txIDStr, String responseData) {
-        PendingRequest request = pendingRequests.remove(txIDStr);
-        if (request != null) {
-            request.future.complete(responseData);
-        }
+    private boolean isRequestCommand(String command) {
+        // Check if a command character represents a request message
+        return "GNERV".contains(command);
     }
 
-    private void handleRelayMessage(byte[] txID, String relayMessage, InetAddress address, int port) {
-        try {
-            // Format: nodeName message
-            // Extract the node name and the message to relay
-            String[] parts = relayMessage.split(" ", 4);
-            if (parts.length < 4) {
-                return;
-            }
+    // Network Request Methods
 
-            int nodeNameSpaces = Integer.parseInt(parts[0]);
-            String nodeName = parts[1];
+    private List<Map.Entry<String, String>> sendNearestRequest(String hashIdHex, InetSocketAddress nodeAddr) throws Exception {
+        String seqId = generateSequenceId();
+        String request = seqId + " N " + hashIdHex;
 
-            // Calculate the start index for the relayed message
-            // Convert the index calculation to an integer
-            int relayedMessageStart = parts[0].length() + 1 + nodeName.length() + 1;
-            String messageToRelay = relayMessage.substring(relayedMessageStart);
+        System.out.println("[DEBUG] Sending nearest request to " + nodeAddr.getAddress().getHostAddress() + ":" + nodeAddr.getPort() + " with hash: " + hashIdHex);
 
-            // Find the address for the target node
-            AddressEntry targetNode = findAddressByNodeName(nodeName);
-            if (targetNode == null) {
-                // Can't relay if we don't know the node
-                return;
-            }
+        AtomicReference<List<Map.Entry<String, String>>> result = new AtomicReference<>(null);
+        CountDownLatch latch = new CountDownLatch(1);
 
-            // Parse the target address
-            String[] addressParts = targetNode.address.split(":");
-            if (addressParts.length != 2) {
-                return;
-            }
-
-            InetAddress targetAddress = InetAddress.getByName(addressParts[0]);
-            int targetPort = Integer.parseInt(addressParts[1]);
-
-            // Extract the transaction ID from the message to relay
-            byte[] relayTxID = messageToRelay.substring(0, 2).getBytes(StandardCharsets.UTF_8);
-            char messageType = messageToRelay.charAt(3);
-
-            // Send the message to the target node
-            DatagramPacket packet = new DatagramPacket(
-                    messageToRelay.getBytes(StandardCharsets.UTF_8),
-                    messageToRelay.length(),
-                    targetAddress,
-                    targetPort
-            );
-            socket.send(packet);
-
-            // If this is a request message, we need to wait for a response and relay it back
-            if (messageType == 'G' || messageType == 'N' || messageType == 'E' ||
-                    messageType == 'R' || messageType == 'W' || messageType == 'C') {
-
-                // Store the original transaction ID and sender info to relay the response back
-                String relayTxIDStr = new String(relayTxID, StandardCharsets.UTF_8);
-                PendingRequest pendingRelay = new PendingRequest(txID, address, port, "");
-                pendingRequests.put(relayTxIDStr, pendingRelay);
-            }
-        } catch (Exception e) {
-            System.err.println("Error handling relay message: " + e.getMessage());
-        }
-    }
-
-// Helper methods for sending protocol-specific requests
-
-    private String sendNameRequest(AddressEntry node) throws Exception {
-        String[] addressParts = node.address.split(":");
-        if (addressParts.length != 2) {
-            throw new IllegalArgumentException("Invalid address: " + node.address);
-        }
-
-        InetAddress address = InetAddress.getByName(addressParts[0]);
-        int port = Integer.parseInt(addressParts[1]);
-
-        String request = constructRequest("G");
-        CompletableFuture<String> future = sendRequestWithRelay(request, address, port);
-
-        String response = future.get(15, TimeUnit.SECONDS);
-        if (response != null && response.startsWith("H")) {
-            String[] parts = response.split(" ", 3);
-            if (parts.length >= 3) {
-                return parseString(parts[1] + " " + parts[2]);
-            }
-        }
-
-        return null;
-    }
-
-    private List<AddressEntry> sendNearestRequest(String hashIDHex, AddressEntry node) throws Exception {
-        System.out.println("[DEBUG] Sending nearest request for " + hashIDHex + " to " + node.nodeName);
-
-        String[] addressParts = node.address.split(":");
-        if (addressParts.length != 2) {
-            throw new IllegalArgumentException("Invalid address: " + node.address);
-        }
-
-        InetAddress address = InetAddress.getByName(addressParts[0]);
-        int port = Integer.parseInt(addressParts[1]);
-
-        String request = constructRequest("N " + hashIDHex);
-        System.out.println("[DEBUG] Nearest request: " + request);
-
-        CompletableFuture<String> future = sendRequestWithRelay(request, address, port);
-
-        String response = future.get(15, TimeUnit.SECONDS);
-        System.out.println("[DEBUG] Nearest response: " + response);
-
-        List<AddressEntry> result = new ArrayList<>();
-
-        if (response != null && response.startsWith("O")) {
-            System.out.println("[DEBUG] Parsing O response: " + response.substring(2));
-
-            // Parse the response to extract address entries
+        pendingRequests.put(seqId, response -> {
             try {
-                // The issue is likely in this parsing logic
-                // Your colleague mentioned this is a common issue
+                System.out.println("[DEBUG] Received nearest response: " + response);
 
-                // Let's try a simpler approach to parse the O response
-                String responseData = response.substring(2).trim();
-                String[] parts = responseData.split(" 0 ");
+                // Parse the nearest response containing address key/value pairs
+                List<Map.Entry<String, String>> nodes = new ArrayList<>();
+                String[] parts = splitStringFormat(response);
 
-                System.out.println("[DEBUG] Split into " + parts.length + " parts");
+                System.out.println("[DEBUG] Split response into " + parts.length + " parts");
 
-                for (int i = 1; i < parts.length; i += 2) {
-                    try {
-                        if (i + 1 >= parts.length) {
-                            System.out.println("[DEBUG] Not enough parts for a complete entry at index " + i);
-                            continue;
-                        }
+                for (int i = 0; i < parts.length; i += 2) {
+                    if (i + 1 < parts.length) {
+                        String nodeName = parts[i];
+                        String nodeAddress = parts[i + 1];
 
-                        String nodeName = parts[i].trim();
-                        String nodeAddress = parts[i + 1].trim();
+                        System.out.println("[DEBUG] Found node: " + nodeName + " at " + nodeAddress);
 
-                        System.out.println("[DEBUG] Parsed node: " + nodeName + " at " + nodeAddress);
+                        nodes.add(new AbstractMap.SimpleEntry<>(nodeName, nodeAddress));
 
+                        // Store node information
                         if (nodeName.startsWith("N:")) {
-                            byte[] hashID = getHashID(nodeName);
-                            result.add(new AddressEntry(nodeName, nodeAddress, hashID, 0));
-
-                            // Also store this address for future use
-                            storeAddressKeyValue(nodeName, nodeAddress);
+                            updateNodeAddress(nodeName, nodeAddress);
+                            keyValueStore.put(nodeName, nodeAddress);
                         }
-                    } catch (Exception e) {
-                        System.out.println("[DEBUG] Error parsing entry at index " + i + ": " + e.getMessage());
                     }
                 }
+
+                result.set(nodes);
+                latch.countDown();
             } catch (Exception e) {
                 System.out.println("[DEBUG] Error parsing nearest response: " + e.getMessage());
+                latch.countDown();
             }
-        }
+        });
 
-        System.out.println("[DEBUG] Found " + result.size() + " nodes from nearest request");
-        return result;
-    }
-
-    private String sendKeyExistenceRequest(String key, AddressEntry node) throws Exception {
-        String[] addressParts = node.address.split(":");
-        if (addressParts.length != 2) {
-            throw new IllegalArgumentException("Invalid address: " + node.address);
-        }
-
-        InetAddress address = InetAddress.getByName(addressParts[0]);
-        int port = Integer.parseInt(addressParts[1]);
-
-        String request = constructRequest("E " + key);
-        CompletableFuture<String> future = sendRequestWithRelay(request, address, port);
-
-        String response = future.get(15, TimeUnit.SECONDS);
-        if (response != null && response.startsWith("F")) {
-            return response.substring(2).trim();
-        }
-
-        return null;
-    }
-
-    private String sendReadRequest(String key, AddressEntry node) throws Exception {
-        String[] addressParts = node.address.split(":");
-        if (addressParts.length != 2) {
-            throw new IllegalArgumentException("Invalid address: " + node.address);
-        }
-
-        InetAddress address = InetAddress.getByName(addressParts[0]);
-        int port = Integer.parseInt(addressParts[1]);
-
-        String request = constructRequest("R " + key);
-        CompletableFuture<String> future = sendRequestWithRelay(request, address, port);
-
-        String response = future.get(15, TimeUnit.SECONDS);
-        if (response != null && response.startsWith("S")) {
-            String[] parts = response.substring(2).split(" ", 3);
-            if (parts.length >= 3 && parts[0].equals("Y")) {
-                return parseString(parts[1] + " " + parts[2]);
-            }
-        }
-
-        return null;
-    }
-
-    private boolean sendWriteRequest(String key, String value, AddressEntry node) throws Exception {
-        String[] addressParts = node.address.split(":");
-        if (addressParts.length != 2) {
-            throw new IllegalArgumentException("Invalid address: " + node.address);
-        }
-
-        InetAddress address = InetAddress.getByName(addressParts[0]);
-        int port = Integer.parseInt(addressParts[1]);
-
-        String request = constructRequest("W " + formatString(key) + formatString(value));
-        CompletableFuture<String> future = sendRequestWithRelay(request, address, port);
-
-        String response = future.get(15, TimeUnit.SECONDS);
-        if (response != null && response.startsWith("X")) {
-            String result = response.substring(2).trim();
-            return result.equals("R") || result.equals("A");
-        }
-
-        return false;
-    }
-
-    private boolean sendCASRequest(String key, String currentValue, String newValue, AddressEntry node) throws Exception {
-        String[] addressParts = node.address.split(":");
-        if (addressParts.length != 2) {
-            throw new IllegalArgumentException("Invalid address: " + node.address);
-        }
-
-        InetAddress address = InetAddress.getByName(addressParts[0]);
-        int port = Integer.parseInt(addressParts[1]);
-
-        String request = constructRequest("C " + formatString(key) + formatString(currentValue) + formatString(newValue));
-        CompletableFuture<String> future = sendRequestWithRelay(request, address, port);
-
-        String response = future.get(15, TimeUnit.SECONDS);
-        if (response != null && response.startsWith("D")) {
-            String result = response.substring(2).trim();
-            return result.equals("R") || result.equals("A");
-        }
-
-        return false;
-    }
-
-    private String constructRequest(String requestContent) {
-        byte[] txID = generateTransactionID();
-        return new String(txID, StandardCharsets.UTF_8) + " " + requestContent;
-    }
-
-    private CompletableFuture<String> sendRequestWithRelay(String request, InetAddress address, int port) {
-        // If relay stack is empty, send directly
-        if (relayStack.isEmpty()) {
-            return sendRequest(request, address, port);
-        }
-
-        // We need to relay through the stack
-        try {
-            Iterator<String> it = relayStack.iterator();
-            String message = request;
-
-            // Build relay message chain from the bottom of the stack up
-            while (it.hasNext()) {
-                String relayNodeName = it.next();
-                byte[] txID = generateTransactionID();
-                message = new String(txID, StandardCharsets.UTF_8) + " V " + formatString(relayNodeName) + message;
+        // Send the request with retries
+        boolean responseReceived = false;
+        for (int retry = 0; retry < MAX_RETRIES && !responseReceived; retry++) {
+            if (retry > 0) {
+                System.out.println("[DEBUG] Retrying nearest request, attempt " + (retry + 1));
             }
 
-            // Find the first relay node
-            String firstRelayNodeName = relayStack.getLast();
-            AddressEntry firstRelay = findAddressByNodeName(firstRelayNodeName);
+            sendPacket(request, nodeAddr.getAddress(), nodeAddr.getPort());
 
-            if (firstRelay == null) {
-                CompletableFuture<String> future = new CompletableFuture<>();
-                future.completeExceptionally(new Exception("First relay node not found: " + firstRelayNodeName));
-                return future;
+            // Wait for the response with timeout
+            responseReceived = latch.await(REQUEST_TIMEOUT, TimeUnit.MILLISECONDS);
+        }
+
+        if (!responseReceived) {
+            System.out.println("[DEBUG] No response received for nearest request after " + MAX_RETRIES + " attempts");
+        }
+
+        pendingRequests.remove(seqId);
+        return result.get();
+    }
+
+    private boolean sendExistsRequest(String key, InetSocketAddress nodeAddr) throws Exception {
+        String seqId = generateSequenceId();
+        String request = seqId + " E " + formatString(key);
+
+        AtomicBoolean result = new AtomicBoolean(false);
+        CountDownLatch latch = new CountDownLatch(1);
+
+        pendingRequests.put(seqId, response -> {
+            if (!response.isEmpty() && response.charAt(0) == 'Y') {
+                result.set(true);
+            }
+            latch.countDown();
+        });
+
+        // Send the request with retries
+        boolean responseReceived = false;
+        for (int retry = 0; retry < MAX_RETRIES && !responseReceived; retry++) {
+            sendPacket(request, nodeAddr.getAddress(), nodeAddr.getPort());
+
+            // Wait for the response with timeout
+            responseReceived = latch.await(REQUEST_TIMEOUT, TimeUnit.MILLISECONDS);
+        }
+
+        pendingRequests.remove(seqId);
+        return result.get();
+    }
+
+    private String sendReadRequest(String key, InetSocketAddress nodeAddr) throws Exception {
+        String seqId = generateSequenceId();
+        String request = seqId + " R " + formatString(key);
+
+        System.out.println("[DEBUG] Sending read request to " + nodeAddr.getAddress().getHostAddress() + ":" + nodeAddr.getPort() + " for key: " + key);
+
+        AtomicReference<String> result = new AtomicReference<>(null);
+        CountDownLatch latch = new CountDownLatch(1);
+
+        pendingRequests.put(seqId, response -> {
+            try {
+                System.out.println("[DEBUG] Received read response: " + response);
+
+                // Parse the read response - first character is Y/N/?
+                if (response.startsWith("Y")) {
+                    // Extract the value from the response
+                    String valueStr = response.substring(2); // Skip "Y " prefix
+                    System.out.println("[DEBUG] Extracted response value: " + valueStr.substring(0, Math.min(20, valueStr.length())) + "...");
+
+                    // Extract from the CRN string format
+                    String[] parts = valueStr.split(" ", 2);
+                    if (parts.length > 1) {
+                        result.set(parts[1]);
+                    } else {
+                        result.set("");
+                    }
+                } else if (response.startsWith("N")) {
+                    System.out.println("[DEBUG] Node does not have the key but should.");
+                } else if (response.startsWith("?")) {
+                    System.out.println("[DEBUG] Node is not responsible for this key.");
+                } else {
+                    System.out.println("[DEBUG] Unknown response format: " + response);
+                }
+
+                latch.countDown();
+            } catch (Exception e) {
+                System.out.println("[DEBUG] Error parsing read response: " + e.getMessage());
+                e.printStackTrace();
+                latch.countDown();
+            }
+        });
+
+        // Send the request with retries
+        boolean responseReceived = false;
+        for (int retry = 0; retry < MAX_RETRIES && !responseReceived; retry++) {
+            if (retry > 0) {
+                System.out.println("[DEBUG] Retrying read request, attempt " + (retry + 1));
             }
 
-            // Send to the first relay node
-            String[] relayAddressParts = firstRelay.address.split(":");
-            InetAddress relayAddress = InetAddress.getByName(relayAddressParts[0]);
-            int relayPort = Integer.parseInt(relayAddressParts[1]);
+            sendPacket(request, nodeAddr.getAddress(), nodeAddr.getPort());
 
-            return sendRequest(message, relayAddress, relayPort);
-        } catch (Exception e) {
-            CompletableFuture<String> future = new CompletableFuture<>();
-            future.completeExceptionally(e);
-            return future;
+            // Wait for the response with timeout
+            responseReceived = latch.await(REQUEST_TIMEOUT, TimeUnit.MILLISECONDS);
         }
+
+        if (!responseReceived) {
+            System.out.println("[DEBUG] No response received for read request after " + MAX_RETRIES + " attempts");
+        }
+
+        pendingRequests.remove(seqId);
+        return result.get();
     }
 
-    // Cleanup method to call before shutting down
-    public void shutdown() {
-        running = false;
-        requestTimeoutService.shutdown();
-        messageProcessor.shutdown();
+    private boolean sendWriteRequest(String key, String value, InetSocketAddress nodeAddr) throws Exception {
+        String seqId = generateSequenceId();
+        String request = seqId + " W " + formatString(key) + formatString(value);
 
-        if (socket != null && !socket.isClosed()) {
-            socket.close();
+        AtomicBoolean result = new AtomicBoolean(false);
+        CountDownLatch latch = new CountDownLatch(1);
+
+        pendingRequests.put(seqId, response -> {
+            // 'R' or 'A' response characters indicate success
+            if (!response.isEmpty() && (response.charAt(0) == 'R' || response.charAt(0) == 'A')) {
+                result.set(true);
+            }
+            latch.countDown();
+        });
+
+        // Send the request with retries
+        boolean responseReceived = false;
+        for (int retry = 0; retry < MAX_RETRIES && !responseReceived; retry++) {
+            sendPacket(request, nodeAddr.getAddress(), nodeAddr.getPort());
+
+            // Wait for the response with timeout
+            responseReceived = latch.await(REQUEST_TIMEOUT, TimeUnit.MILLISECONDS);
         }
+
+        pendingRequests.remove(seqId);
+        return result.get();
     }
 
-    // HashID utility class
-    private static class HashID {
-        public static byte[] computeHashID(String key) throws Exception {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return digest.digest(key.getBytes(StandardCharsets.UTF_8));
+    private boolean sendCASRequest(String key, String currentValue, String newValue, InetSocketAddress nodeAddr) throws Exception {
+        String seqId = generateSequenceId();
+        String request = seqId + " C " + formatString(key) + formatString(currentValue) + formatString(newValue);
+
+        AtomicBoolean result = new AtomicBoolean(false);
+        CountDownLatch latch = new CountDownLatch(1);
+
+        pendingRequests.put(seqId, response -> {
+            // 'R' or 'A' response characters indicate success
+            if (!response.isEmpty() && (response.charAt(0) == 'R' || response.charAt(0) == 'A')) {
+                result.set(true);
+            }
+            latch.countDown();
+        });
+
+        // Send the request with retries
+        boolean responseReceived = false;
+        for (int retry = 0; retry < MAX_RETRIES && !responseReceived; retry++) {
+            sendPacket(request, nodeAddr.getAddress(), nodeAddr.getPort());
+
+            // Wait for the response with timeout
+            responseReceived = latch.await(REQUEST_TIMEOUT, TimeUnit.MILLISECONDS);
         }
+
+        pendingRequests.remove(seqId);
+        return result.get();
+    }
+
+    // Interface for response handling
+    private interface ResponseHandler {
+        void handleResponse(String response);
     }
 }
